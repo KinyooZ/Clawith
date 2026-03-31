@@ -25,7 +25,16 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
             window.location.href = '/login';
             throw new Error('Session expired');
         }
-        const error = await res.json().catch(() => ({ detail: 'Request failed' }));
+        const bodyText = await res.text();
+        let error: { detail?: unknown };
+        try {
+            error = bodyText ? JSON.parse(bodyText) : {};
+        } catch {
+            const snippet = bodyText.trim().slice(0, 280);
+            error = {
+                detail: snippet || `HTTP ${res.status} ${res.statusText || ''}`.trim(),
+            };
+        }
         // Pydantic validation errors return detail as an array of objects
         const fieldLabels: Record<string, string> = {
             name: '名称',
