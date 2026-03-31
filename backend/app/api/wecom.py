@@ -13,6 +13,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -162,9 +163,9 @@ async def configure_wecom_channel(
             asyncio.create_task(
                 wecom_stream_manager.start_client(agent_id, bot_id, bot_secret)
             )
-            print(f"[WeCom] WebSocket client start triggered for agent {agent_id}", flush=True)
+            logger.info(f"[WeCom] WebSocket client start triggered for agent {agent_id}")
         except Exception as e:
-            print(f"[WeCom] Failed to start WebSocket client: {e}", flush=True)
+            logger.error(f"[WeCom] Failed to start WebSocket client: {e}")
 
     return config_out
 
@@ -232,6 +233,8 @@ async def delete_wecom_channel(
 # ─── Event Webhook ──────────────────────────────────────
 
 _processed_wecom_events: set[str] = set()
+_processed_kf_msgids: set[str] = set()
+
 
 
 @router.get("/channel/wecom/{agent_id}/webhook")
@@ -260,7 +263,7 @@ async def wecom_verify_webhook(
     # Verify signature
     expected_sig = _verify_signature(token, timestamp, nonce, echostr)
     if expected_sig != msg_signature:
-        print(f"[WeCom] Signature mismatch: expected={expected_sig}, got={msg_signature}")
+        logger.warning(f"[WeCom] Signature mismatch: expected={expected_sig}, got={msg_signature}")
         return Response(status_code=403)
 
     # Decrypt echostr and return plaintext
@@ -268,7 +271,7 @@ async def wecom_verify_webhook(
         decrypted, _ = _decrypt_msg(encoding_aes_key, echostr)
         return Response(content=decrypted, media_type="text/plain")
     except Exception as e:
-        print(f"[WeCom] Failed to decrypt echostr: {e}")
+        logger.error(f"[WeCom] Failed to decrypt echostr: {e}")
         return Response(status_code=500)
 
 
@@ -304,44 +307,49 @@ async def wecom_event_webhook(
         root = ET.fromstring(body_bytes)
         encrypt_text = root.findtext("Encrypt", "")
     except Exception as e:
-        print(f"[WeCom] Failed to parse XML body: {e}")
+        logger.error(f"[WeCom] Failed to parse XML body: {e}")
         return Response(content="success", media_type="text/plain")
 
     # Verify signature
     expected_sig = _verify_signature(token, timestamp, nonce, encrypt_text)
     if expected_sig != msg_signature:
-        print(f"[WeCom] Signature mismatch on POST")
+        logger.warning("[WeCom] Signature mismatch on POST")
         return Response(status_code=403)
 
     # Decrypt message
     try:
         decrypted_xml, recv_corp_id = _decrypt_msg(encoding_aes_key, encrypt_text)
     except Exception as e:
-        print(f"[WeCom] Failed to decrypt message: {e}")
+        logger.error(f"[WeCom] Failed to decrypt message: {e}")
         return Response(content="success", media_type="text/plain")
 
-    print(f"[WeCom] Decrypted event for {agent_id}")
+    logger.info(f"[WeCom] Decrypted event for {agent_id}")
 
     # Parse decrypted message XML
     try:
         msg_root = ET.fromstring(decrypted_xml)
     except Exception as e:
-        print(f"[WeCom] Failed to parse decrypted XML: {e}")
+        logger.error(f"[WeCom] Failed to parse decrypted XML: {e}")
         return Response(content="success", media_type="text/plain")
 
     msg_type = msg_root.findtext("MsgType", "")
     from_user = msg_root.findtext("FromUserName", "")  # WeCom userid
     msg_id = msg_root.findtext("MsgId", "")
+    open_kfid = msg_root.findtext("OpenKfId", "")
+    token = msg_root.findtext("Token", "")
+    # Group chat ID — present when message comes from a WeCom group
+    chat_id = msg_root.findtext("ChatId", "")
 
     # Dedup
-    if msg_id and msg_id in _processed_wecom_events:
+    dedup_key = msg_id if msg_id else token
+    if dedup_key and dedup_key in _processed_wecom_events:
         return Response(content="success", media_type="text/plain")
-    if msg_id:
-        _processed_wecom_events.add(msg_id)
+    if dedup_key:
+        _processed_wecom_events.add(dedup_key)
         if len(_processed_wecom_events) > 1000:
             _processed_wecom_events.clear()
 
-    print(f"[WeCom] Message type={msg_type}, from={from_user}, msg_id={msg_id}")
+    logger.info(f"[WeCom] Message type={msg_type}, from={from_user}, msg_id={msg_id}, chat_id={chat_id or 'N/A'}")
 
     if msg_type == "text":
         user_text = msg_root.findtext("Content", "").strip()
@@ -351,14 +359,93 @@ async def wecom_event_webhook(
         # Process in background task
         import asyncio
         asyncio.create_task(
-            _process_wecom_text(db, agent_id, config, from_user, user_text)
+            _process_wecom_text(db, agent_id, config, from_user, user_text, chat_id=chat_id)
         )
+
+    elif msg_type == "event":
+        event = msg_root.findtext("Event", "")
+        if event == "kf_msg_or_event":
+            import asyncio
+            asyncio.create_task(
+                _process_wecom_kf_event(agent_id, config, token, open_kfid)
+            )
+        else:
+            logger.info(f"[WeCom] Received event: {event} (not handled)")
 
     elif msg_type in ("image", "file"):
         # TODO: Handle image/file messages in future
-        print(f"[WeCom] Received {msg_type} message (not yet handled)")
+        logger.info(f"[WeCom] Received {msg_type} message (not yet handled)")
 
     return Response(content="success", media_type="text/plain")
+
+
+async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig, token: str, open_kfid: str = None):
+    """Sync WeCom Customer Service (KF) messages in background."""
+    import httpx
+    import time
+    from app.database import async_session
+    from sqlalchemy import select as _select
+    from app.models.channel_config import ChannelConfig as ChannelConfigModel
+    
+    try:
+        async with async_session() as session:
+            r = await session.execute(_select(ChannelConfigModel).where(ChannelConfigModel.agent_id == agent_id, ChannelConfigModel.channel_type == "wecom"))
+            config = r.scalar_one_or_none()
+            if not config:
+                return
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                tok_resp = await client.get("https://qyapi.weixin.qq.com/cgi-bin/gettoken", params={"corpid": config.app_id, "corpsecret": config.app_secret})
+                token_data = tok_resp.json()
+                access_token = token_data.get("access_token")
+                if not access_token:
+                    return
+
+                current_cursor = token
+                has_more = 1
+                current_ts = int(time.time())
+
+                while has_more:
+                    payload = {"limit": 20}
+                    if open_kfid:
+                        payload["open_kfid"] = open_kfid
+
+                    if current_cursor.startswith("ENC"):
+                        payload["token"] = current_cursor
+                    else:
+                        payload["cursor"] = current_cursor
+                    
+                    logger.info(f"[WeCom KF] Calling sync_msg with payload: {payload}")
+                    sync_resp = await client.post(f"https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token={access_token}", json=payload)
+                    sync_data = sync_resp.json()
+                    if sync_data.get("errcode") != 0:
+                        logger.error(f"[WeCom KF] sync_msg error: {sync_data}")
+                        break
+                    
+                    has_more = sync_data.get("has_more", 0)
+                    current_cursor = sync_data.get("next_cursor", "")
+                    
+                    for msg in sync_data.get("msg_list", []):
+                        if msg.get("origin") == 3 and msg.get("msgtype") == "text":
+                            mid = msg.get("msgid")
+                            if mid in _processed_kf_msgids:
+                                continue
+                            if msg.get("send_time", 0) > 0 and (current_ts - msg.get("send_time", 0) > 86400):
+                                continue
+                            _processed_kf_msgids.add(mid)
+                            text = msg.get("text", {}).get("content", "").strip()
+                            if text:
+                                logger.info(f"[WeCom KF] Found msg from {msg.get('external_userid')}: {text[:20]}...")
+                                # Call the local process text with extra KF info
+                                await _process_wecom_text(
+                                    session, agent_id, config, 
+                                    msg.get("external_userid"), text,
+                                    is_kf=True, open_kfid=msg.get("open_kfid"), kf_msg_id=mid
+                                )
+                    if not has_more:
+                        break
+    except Exception as e: 
+        logger.error(f"[WeCom KF] Error in background task: {e}")
 
 
 async def _process_wecom_text(
@@ -367,6 +454,10 @@ async def _process_wecom_text(
     config: ChannelConfig,
     from_user: str,
     user_text: str,
+    is_kf: bool = False,
+    open_kfid: str = None,
+    kf_msg_id: str = None,
+    chat_id: str = "",
 ):
     """Process an incoming WeCom text message and reply."""
     import json
@@ -386,12 +477,17 @@ async def _process_wecom_text(
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
         if not agent_obj:
-            print(f"[WeCom] Agent {agent_id} not found")
+            logger.warning(f"[WeCom] Agent {agent_id} not found")
             return
         creator_id = agent_obj.creator_id
         ctx_size = agent_obj.context_window_size if agent_obj else 20
 
-        conv_id = f"wecom_p2p_{from_user}"
+        # Distinguish group chat from P2P by chat_id presence
+        _is_group = bool(chat_id)
+        if _is_group:
+            conv_id = f"wecom_group_{chat_id}"
+        else:
+            conv_id = f"wecom_p2p_{from_user}"
 
         # Find or create platform user
         wc_username = f"wecom_{from_user}"
@@ -416,7 +512,7 @@ async def _process_wecom_text(
                     if user_data.get("errcode") == 0:
                         display_name = user_data.get("name", display_name)
         except Exception as e:
-            print(f"[WeCom] Failed to resolve user info: {e}")
+            logger.error(f"[WeCom] Failed to resolve user info: {e}")
 
         if not platform_user:
             import uuid as _uuid
@@ -436,10 +532,12 @@ async def _process_wecom_text(
         sess = await find_or_create_channel_session(
             db=db,
             agent_id=agent_id,
-            user_id=platform_user_id,
+            user_id=creator_id if _is_group else platform_user_id,
             external_conv_id=conv_id,
             source_channel="wecom",
             first_message_title=user_text,
+            is_group=_is_group,
+            group_name=f"WeCom Group {chat_id[:8]}" if _is_group else None,
         )
         session_conv_id = str(sess.id)
 
@@ -466,7 +564,7 @@ async def _process_wecom_text(
             db, agent_id, user_text,
             history=history, user_id=platform_user_id,
         )
-        print(f"[WeCom] LLM reply: {reply_text[:100]}")
+        logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
 
         # Send reply via WeCom API
         wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
@@ -478,18 +576,31 @@ async def _process_wecom_text(
                 )
                 access_token = tok_resp.json().get("access_token", "")
                 if access_token:
-                    # Send as markdown first (better formatting, but WeCom-client-only)
-                    await client.post(
-                        f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
-                        json={
-                            "touser": from_user,
-                            "msgtype": "text",
-                            "agentid": int(wecom_agent_id) if wecom_agent_id else 0,
-                            "text": {"content": reply_text},
-                        },
-                    )
+                    if is_kf and open_kfid:
+                        # For KF messages, need to bridge/trans state first then send via kf/send_msg
+                        res_state = await client.post(
+                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}", 
+                            json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1}
+                        )
+                        logger.info(f"[WeCom KF] trans state result: {res_state.json()}")
+                        res_send = await client.post(
+                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}", 
+                            json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": reply_text}}
+                        )
+                        logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
+                    else:
+                        # Default legacy Send as text
+                        await client.post(
+                            f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
+                            json={
+                                "touser": from_user,
+                                "msgtype": "text",
+                                "agentid": int(wecom_agent_id) if wecom_agent_id else 0,
+                                "text": {"content": reply_text},
+                            },
+                        )
         except Exception as e:
-            print(f"[WeCom] Failed to send reply: {e}")
+            logger.error(f"[WeCom] Failed to send reply: {e}")
 
         # Save assistant reply
         db.add(ChatMessage(
@@ -507,3 +618,168 @@ async def _process_wecom_text(
             f"Replied to WeCom message: {reply_text[:80]}",
             detail={"channel": "wecom", "user_text": user_text[:200], "reply": reply_text[:500]},
         )
+
+
+# ─── OAuth Callback (SSO) ──────────────────────────────
+
+@router.get("/auth/wecom/callback")
+async def wecom_callback(
+    code: str,
+    state: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    # 1. Resolve session to get tenant context
+    from app.models.identity import SSOScanSession
+    tenant_id = None
+    if state:
+        try:
+            sid = uuid.UUID(state)
+            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+            session = s_res.scalar_one_or_none()
+            if session:
+                tenant_id = session.tenant_id
+        except (ValueError, AttributeError):
+            pass
+
+    # 1. Get WeCom provider config
+    provider_query = select(IdentityProvider).where(IdentityProvider.provider_type == "wecom")
+    if tenant_id:
+        # Strict scope
+        provider_query = provider_query.where(IdentityProvider.tenant_id == tenant_id)
+    else:
+        # Fallback to unscoped
+        provider_query = provider_query.where(IdentityProvider.tenant_id.is_(None))
+
+    provider_result = await db.execute(provider_query)
+    provider = provider_result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=404, detail="WeCom provider not configured for this tenant")
+
+    config = provider.config
+    corp_id = config.get("app_id") or config.get("corp_id")
+    secret = config.get("app_secret") or config.get("secret")
+
+    # 2. Exchange code for user info
+    try:
+        async with httpx.AsyncClient() as client:
+            # Get access token
+            tok_res = await client.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": corp_id, "corpsecret": secret}
+            )
+            token_data = tok_res.json()
+            access_token = token_data.get("access_token")
+            if not access_token:
+                logger.error(f"WeCom token error: {token_data}")
+                return HTMLResponse(f"Auth failed: Token error")
+
+            # Get user info
+            user_res = await client.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/user/getuserinfo",
+                params={"access_token": access_token, "code": code}
+            )
+            wc_user = user_res.json()
+            userid = wc_user.get("UserId")
+            if not userid:
+                logger.error(f"WeCom userinfo error: {wc_user}")
+                return HTMLResponse("Auth failed: No UserId returned")
+    except Exception as e:
+        logger.error(f"WeCom login error: {e}")
+        return HTMLResponse(f"Auth failed: {str(e)}")
+
+    # 3. Fetch detailed user info (email, name) from WeCom API
+    wc_name = f"WeCom {userid}"
+    wc_email = None
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            tok_res2 = await client.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": corp_id, "corpsecret": secret},
+            )
+            _at2 = tok_res2.json().get("access_token", "")
+            if _at2:
+                detail_res = await client.get(
+                    "https://qyapi.weixin.qq.com/cgi-bin/user/get",
+                    params={"access_token": _at2, "userid": userid},
+                )
+                detail_data = detail_res.json()
+                if detail_data.get("errcode") == 0:
+                    wc_name = detail_data.get("name", wc_name)
+                    wc_email = detail_data.get("email") or detail_data.get("biz_mail")
+                    logger.info(f"WeCom user detail: name={wc_name}, email={wc_email}")
+                else:
+                    logger.warning(f"WeCom user/get failed (non-fatal): {detail_data}")
+    except Exception as e:
+        logger.warning(f"WeCom user detail fetch failed (non-fatal): {e}")
+
+    # 4. Find user via OrgMember (SSO users must be in the org directory)
+    from app.models.org import OrgMember
+
+    # WeCom stores userid in external_id during org sync
+    member_result = await db.execute(
+        select(OrgMember).where(
+            OrgMember.external_id == userid,
+            OrgMember.provider_id == provider.id,
+        )
+    )
+    member = member_result.scalar_one_or_none()
+
+    user = None
+    if member and member.user_id:
+        user_result = await db.execute(select(User).where(User.id == member.user_id))
+        user = user_result.scalar_one_or_none()
+
+    if user:
+        # Sync latest info on every login
+        if (not user.email or user.email.endswith("@wecom.local")) and wc_email:
+            user.email = wc_email
+        if wc_name:
+            user.display_name = wc_name
+    else:
+        # Create new User (first login or OrgMember not yet linked)
+        email = wc_email or f"{userid}@wecom.local"
+        username = wc_email.split("@")[0] if wc_email else f"wc_{userid[:12]}"
+        user = User(
+            username=username,
+            email=email,
+            display_name=wc_name,
+            password_hash=hash_password(uuid.uuid4().hex),
+            role="member",
+            tenant_id=tenant_id or provider.tenant_id,
+        )
+        db.add(user)
+        await db.flush()
+
+        # Link back to OrgMember if found
+        if member:
+            member.user_id = user.id
+
+    await db.flush()
+
+
+    # Standard login
+    token = create_access_token(str(user.id), user.role)
+
+    if state:
+        try:
+            sid = uuid.UUID(state)
+            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+            session = s_res.scalar_one_or_none()
+            if session:
+                session.status = "authorized"
+                session.provider_type = "wecom"
+                session.user_id = user.id
+                session.access_token = token
+                session.error_msg = None
+                await db.commit()
+                return HTMLResponse(
+                    f"""<html><head><meta charset="utf-8" /></head>
+                    <body style="font-family: sans-serif; padding: 24px;">
+                        <div>SSO login successful. Redirecting...</div>
+                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
+                    </body></html>"""
+                )
+        except Exception as e:
+            logger.exception("Failed to update SSO session (wecom) %s", e)
+
+    return HTMLResponse(f"Logged in. Token: {token}")

@@ -35,10 +35,14 @@ class Tenant(Base):
     default_max_llm_calls_per_day: Mapped[int] = mapped_column(Integer, default=100)
 
     # Heartbeat frequency floor (minutes) — agents cannot heartbeat faster than this
-    min_heartbeat_interval_minutes: Mapped[int] = mapped_column(Integer, default=120)
+    min_heartbeat_interval_minutes: Mapped[int] = mapped_column(Integer, default=240)
 
     # Default timezone for all agents in this company (IANA format, e.g. "Asia/Shanghai")
     timezone: Mapped[str] = mapped_column(String(50), default="UTC")
+
+    # SSO configuration
+    sso_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    sso_domain: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
 
     # Trigger limits — defaults for new agents & floor values
     default_max_triggers: Mapped[int] = mapped_column(Integer, default=20)

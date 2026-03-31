@@ -4,6 +4,7 @@ import json
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -41,7 +42,20 @@ class ConnectionManager:
     async def send_message(self, agent_id: str, message: dict):
         if agent_id in self.active_connections:
             for ws, _sid in self.active_connections[agent_id]:
-                await ws.send_json(message)
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    pass
+
+    async def send_to_session(self, agent_id: str, session_id: str, message: dict):
+        """Send message only to WebSocket connections matching the given session_id."""
+        if agent_id in self.active_connections:
+            for ws, sid in self.active_connections[agent_id]:
+                if sid == session_id:
+                    try:
+                        await ws.send_json(message)
+                    except Exception:
+                        pass
 
     def get_active_session_ids(self, agent_id: str) -> list[str]:
         """Return distinct session IDs for all active WS connections of an agent."""
@@ -102,6 +116,7 @@ async def call_llm(
     role_description: str,
     agent_id=None,
     user_id=None,
+    session_id: str = "",
     on_chunk=None,
     on_tool_call=None,
     on_thinking=None,
@@ -148,13 +163,13 @@ async def call_llm(
                     _current_user_name = _u.display_name or _u.username
         except Exception:
             pass
-    system_prompt = await build_agent_context(agent_id, agent_name, role_description, current_user_name=_current_user_name)
+    static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent_name, role_description, current_user_name=_current_user_name)
 
     # Load tools dynamically from DB
     tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
 
     # Convert messages to LLMMessage format
-    api_messages = [LLMMessage(role="system", content=system_prompt)]
+    api_messages = [LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt)]
     for msg in messages:
         api_messages.append(LLMMessage(
             role=msg.get("role", "user"),
@@ -233,7 +248,7 @@ async def call_llm(
         _warn_threshold_96 = _max_tool_rounds - 2
         if round_i == _warn_threshold_80:
             api_messages.append(LLMMessage(
-                role="system",
+                role="user",
                 content=(
                     f"⚠️ 你已使用 {round_i}/{_max_tool_rounds} 轮工具调用。"
                     "如果当前任务尚未完成，请尽快保存进度到 focus.md，"
@@ -242,7 +257,7 @@ async def call_llm(
             ))
         elif round_i == _warn_threshold_96:
             api_messages.append(LLMMessage(
-                role="system",
+                role="user",
                 content=f"🚨 仅剩 2 轮工具调用。请立即保存进度到 focus.md 并设置续接触发器。",
             ))
 
@@ -251,27 +266,25 @@ async def call_llm(
             response = await client.stream(
                 messages=api_messages,
                 tools=tools_for_llm if tools_for_llm else None,
-                temperature=0.7,
+                temperature=model.temperature,
                 max_tokens=max_tokens,
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
             )
         except LLMError as e:
             # Record accumulated tokens before returning error
-            print(
+            logger.error(
                 f"[LLM] LLMError provider={getattr(model, 'provider', '?')} "
-                f"model={getattr(model, 'model', '?')} round={round_i + 1}: {e}",
-                flush=True,
+                f"model={getattr(model, 'model', '?')} round={round_i + 1}: {e}"
             )
             if agent_id and _accumulated_tokens > 0:
                 await record_token_usage(agent_id, _accumulated_tokens)
             return f"[LLM Error] {e}"
         except Exception as e:
-            print(
+            logger.error(
                 f"[LLM] Unexpected error provider={getattr(model, 'provider', '?')} "
                 f"model={getattr(model, 'model', '?')} round={round_i + 1}: "
-                f"{type(e).__name__}: {str(e)[:300]}",
-                flush=True,
+                f"{type(e).__name__}: {str(e)[:300]}"
             )
             if agent_id and _accumulated_tokens > 0:
                 await record_token_usage(agent_id, _accumulated_tokens)
@@ -294,7 +307,7 @@ async def call_llm(
             return response.content or "[LLM returned empty content]"
 
         # Execute tool calls
-        print(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
+        logger.info(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s), finish_reason={response.finish_reason}")
 
         # Add assistant message with tool calls
         api_messages.append(LLMMessage(
@@ -310,17 +323,32 @@ async def call_llm(
 
         full_reasoning_content = response.reasoning_content or ""
 
+        # Tools that require arguments — if LLM sends empty args, skip and ask to retry
+        _TOOLS_REQUIRING_ARGS = {"write_file", "read_file", "delete_file", "read_document", "send_message_to_agent", "send_feishu_message", "send_email"}
+
         for tc in response.tool_calls:
             fn = tc["function"]
             tool_name = fn["name"]
             raw_args = fn.get("arguments", "{}")
-            print(f"[LLM] Raw arguments for {tool_name}: {repr(raw_args[:300])}", flush=True)
+            logger.info(f"[LLM] Raw arguments for {tool_name} (len={len(raw_args)}): {repr(raw_args[:300])}")
             try:
                 args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
                 args = {}
 
-            print(f"[LLM] Calling tool: {tool_name}({args})")
+            # Guard: if a tool that requires arguments received empty args,
+            # return an error to LLM instead of executing (Claude sometimes
+            # emits tool_use blocks with no input_json_delta events)
+            if not args and tool_name in _TOOLS_REQUIRING_ARGS:
+                logger.warning(f"[LLM] Empty arguments for {tool_name}, asking LLM to retry")
+                api_messages.append(LLMMessage(
+                    role="tool",
+                    content=f"Error: {tool_name} was called with empty arguments. You must provide the required parameters. Please retry with the correct arguments.",
+                    tool_call_id=tc.get("id", ""),
+                ))
+                continue
+
+            logger.info(f"[LLM] Calling tool: {tool_name}({args})")
             # Notify client about tool call (in-progress)
             if on_tool_call:
                 try:
@@ -337,8 +365,9 @@ async def call_llm(
                 tool_name, args,
                 agent_id=agent_id,
                 user_id=user_id or agent_id,
+                session_id=session_id,
             )
-            print(f"[LLM] Tool result: {result[:100]}")
+            logger.debug(f"[LLM] Tool result: {result[:100]}")
 
             # Notify client about tool call result
             if on_tool_call:
@@ -350,13 +379,31 @@ async def call_llm(
                         "result": result,
                         "reasoning_content": full_reasoning_content
                     })
-                except Exception:
-                    pass
+                except Exception as _cb_err:
+                    logger.warning(f"[LLM] on_tool_call callback error: {_cb_err}")
+
+            # ── Vision injection for screenshot tools ──
+            # If the model supports vision, try to inject the actual screenshot
+            # image into the tool result so the LLM can SEE what's on screen.
+            # Without this, the LLM only gets text like "Screenshot saved to ..."
+            # and blindly guesses the page content.
+            tool_content: str | list = str(result)
+            if supports_vision and agent_id:
+                try:
+                    from app.services.vision_inject import try_inject_screenshot_vision
+                    from app.services.agent_tools import WORKSPACE_ROOT
+                    ws_path = WORKSPACE_ROOT / str(agent_id)
+                    vision_content = try_inject_screenshot_vision(tool_name, str(result), ws_path)
+                    if vision_content:
+                        tool_content = vision_content
+                        logger.info(f"[LLM] Injected screenshot vision for {tool_name}")
+                except Exception as e:
+                    logger.warning(f"[LLM] Vision injection failed for {tool_name}: {e}")
 
             api_messages.append(LLMMessage(
                 role="tool",
                 tool_call_id=tc["id"],
-                content=str(result),
+                content=tool_content,
             ))
 
     # Record tokens even on "too many rounds" exit
@@ -407,16 +454,16 @@ async def websocket_chat(
 
     try:
         async with async_session() as db:
-            print(f"[WS] Looking up user {user_id}")
+            logger.info(f"[WS] Looking up user {user_id}")
             result = await db.execute(select(User).where(User.id == user_id))
             user = result.scalar_one_or_none()
             if not user:
-                print("[WS] User not found")
+                logger.info("[WS] User not found")
                 await websocket.send_json({"type": "error", "content": "User not found"})
                 await websocket.close(code=4001)
                 return
 
-            print(f"[WS] Checking agent access for {agent_id}")
+            logger.info(f"[WS] Checking agent access for {agent_id}")
             agent, _ = await check_agent_access(db, user, agent_id)
             # Check agent expiry
             if is_agent_expired(agent):
@@ -428,7 +475,7 @@ async def websocket_chat(
             role_description = agent.role_description or ""
             welcome_message = agent.welcome_message or ""
             ctx_size = agent.context_window_size or 100
-            print(f"[WS] Agent: {agent_name}, type: {agent_type}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
+            logger.info(f"[WS] Agent: {agent_name}, type: {agent_type}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
 
             # Load the agent's primary model
             if agent.primary_model_id:
@@ -436,7 +483,12 @@ async def websocket_chat(
                     select(LLMModel).where(LLMModel.id == agent.primary_model_id)
                 )
                 llm_model = model_result.scalar_one_or_none()
-                print(f"[WS] Primary model loaded: {llm_model.model if llm_model else 'None'}")
+                # Treat disabled models as unavailable at runtime
+                if llm_model and not llm_model.enabled:
+                    logger.info(f"[WS] Primary model {llm_model.model} is disabled, skipping")
+                    llm_model = None
+                else:
+                    logger.info(f"[WS] Primary model loaded: {llm_model.model if llm_model else 'None'}")
 
             # Load fallback model
             if agent.fallback_model_id:
@@ -444,14 +496,18 @@ async def websocket_chat(
                     select(LLMModel).where(LLMModel.id == agent.fallback_model_id)
                 )
                 fallback_llm_model = fb_result.scalar_one_or_none()
-                if fallback_llm_model:
-                    print(f"[WS] Fallback model loaded: {fallback_llm_model.model}")
+                # Treat disabled fallback models as unavailable
+                if fallback_llm_model and not fallback_llm_model.enabled:
+                    logger.info(f"[WS] Fallback model {fallback_llm_model.model} is disabled, skipping")
+                    fallback_llm_model = None
+                elif fallback_llm_model:
+                    logger.info(f"[WS] Fallback model loaded: {fallback_llm_model.model}")
 
             # Config-level fallback: primary missing -> use fallback
             if not llm_model and fallback_llm_model:
                 llm_model = fallback_llm_model
                 fallback_llm_model = None  # No further fallback available
-                print(f"[WS] Primary model unavailable, using fallback: {llm_model.model}")
+                logger.info(f"[WS] Primary model unavailable, using fallback: {llm_model.model}")
 
             # Resolve or create chat session
             from app.models.chat_session import ChatSession
@@ -493,21 +549,21 @@ async def websocket_chat(
                     await db.commit()
                     await db.refresh(_new_session)
                     conv_id = str(_new_session.id)
-                    print(f"[WS] Created default session {conv_id}")
+                    logger.info(f"[WS] Created default session {conv_id}")
 
             try:
                 history_result = await db.execute(
                     select(ChatMessage)
                     .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == conv_id)
                     .order_by(ChatMessage.created_at.desc())
-                    .limit(20)
+                    .limit(ctx_size)
                 )
                 history_messages = list(reversed(history_result.scalars().all()))
-                print(f"[WS] Loaded {len(history_messages)} history messages for session {conv_id}")
+                logger.info(f"[WS] Loaded {len(history_messages)} history messages for session {conv_id}")
             except Exception as e:
-                print(f"[WS] History load failed (non-fatal): {e}")
+                logger.warning(f"[WS] History load failed (non-fatal): {e}")
     except Exception as e:
-        print(f"[WS] Setup error: {type(e).__name__}: {e}")
+        logger.error(f"[WS] Setup error: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         await websocket.send_json({"type": "error", "content": "Setup failed"})
@@ -518,7 +574,10 @@ async def websocket_chat(
     if agent_id_str not in manager.active_connections:
         manager.active_connections[agent_id_str] = []
     manager.active_connections[agent_id_str].append((websocket, conv_id))
-    print(f"[WS] Ready! Agent={agent_name}")
+    logger.info(f"[WS] Ready! Agent={agent_name}")
+
+    # Send session_id to frontend so Take Control can reference the correct session
+    await websocket.send_json({"type": "connected", "session_id": conv_id})
 
     # Build conversation context from history
     # IMPORTANT: Include tool_call messages so the LLM maintains tool-calling behavior.
@@ -547,11 +606,16 @@ async def websocket_chat(
                 if tc_data.get("reasoning_content"):
                     asst_msg["reasoning_content"] = tc_data["reasoning_content"]
                 conversation.append(asst_msg)
-                # Tool result message
+                # Tool result message.
+                # Sanitize any stale [ImageID: ...] markers left by the ephemeral
+                # screenshot cache — those images are gone from memory and would
+                # confuse the LLM if sent as-is.
+                from app.services.vision_inject import sanitize_history_tool_result
+                sanitized_result = sanitize_history_tool_result(str(tc_result))
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
-                    "content": str(tc_result)[:500],
+                    "content": sanitized_result[:500],
                 })
             except Exception:
                 continue  # Skip malformed tool_call records
@@ -567,12 +631,19 @@ async def websocket_chat(
             await websocket.send_json({"type": "done", "role": "assistant", "content": welcome_message})
 
         while True:
-            print(f"[WS] Waiting for message from {agent_name}...")
+            logger.info(f"[WS] Waiting for message from {agent_name}...")
             data = await websocket.receive_json()
+
+            # Set a unique trace ID for this specific message processing
+            from app.core.logging_config import set_trace_id
+            import uuid as _trace_uuid
+            trace_id = str(_trace_uuid.uuid4())[:12]
+            set_trace_id(trace_id)
+
             content = data.get("content", "")
             display_content = data.get("display_content", "")  # User-facing display text
             file_name = data.get("file_name", "")  # Original file name for attachment display
-            print(f"[WS] Received: {content[:50]}")
+            logger.info(f"[WS] Received: {content[:50]}")
 
             if not content:
                 continue
@@ -629,7 +700,7 @@ async def websocket_chat(
                             clean_title = f"📎 {file_name}"
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
-            print("[WS] User message saved")
+            logger.info("[WS] User message saved")
 
             # ── OpenClaw routing: insert into gateway_messages instead of LLM ──
             if agent_type == "openclaw":
@@ -644,7 +715,7 @@ async def websocket_chat(
                     )
                     db.add(gw_msg)
                     await db.commit()
-                print(f"[WS] OpenClaw: message queued for gateway poll")
+                logger.info("[WS] OpenClaw: message queued for gateway poll")
                 await websocket.send_json({
                     "type": "done",
                     "role": "assistant",
@@ -659,10 +730,13 @@ async def websocket_chat(
                 content, re.IGNORECASE
             )
 
+            # Track thinking content for storage (initialize before condition)
+            thinking_content = []
+
             # Call LLM with streaming
             if llm_model:
                 try:
-                    print(f"[WS] Calling LLM {llm_model.model} (streaming)...")
+                    logger.info(f"[WS] Calling LLM {llm_model.model} (streaming)...")
                     
                     # Accumulate partial content for abort handling
                     partial_chunks: list[str] = []
@@ -672,9 +746,39 @@ async def websocket_chat(
                         partial_chunks.append(text)
                         await websocket.send_json({"type": "chunk", "content": text})
                     
+                    # Track which agentbay live URLs have been sent to avoid redundant pushes
+                    _sent_live_envs: set[str] = set()
+
                     async def tool_call_to_ws(data: dict):
                         """Send tool call info to client and persist completed ones."""
+                        # ── AgentBay live preview: embed screenshot URL in tool_call message ──
+                        # We embed live preview data directly in the tool_call payload
+                        # because separate WebSocket messages get silently dropped by nginx.
+                        if data.get("status") == "done":
+                            try:
+                                from app.services.agentbay_live import detect_agentbay_env, get_desktop_screenshot, get_browser_snapshot
+                                import re as _re_live
+                                tool_name = data.get("name", "")
+                                env = detect_agentbay_env(tool_name)
+                                if env:
+                                    tool_result = data.get("result", "") or ""
+                                    if env == "desktop":
+                                        b64_url = await get_desktop_screenshot(agent_id, session_id=conv_id)
+                                        if b64_url:
+                                            data["live_preview"] = {"env": env, "screenshot_url": b64_url}
+                                            logger.info(f"[WS][LivePreview] Embedded {env} base64 in tool_call")
+                                    elif env == "browser":
+                                        b64_url = await get_browser_snapshot(agent_id, session_id=conv_id)
+                                        if b64_url:
+                                            data["live_preview"] = {"env": env, "screenshot_url": b64_url}
+                                            logger.info(f"[WS][LivePreview] Embedded {env} base64 in tool_call")
+                                    elif env == "code":
+                                        data["live_preview"] = {"env": "code", "output": tool_result[:5000]}
+                            except Exception as _lp_err:
+                                logger.warning(f"[WS][LivePreview] Embed failed: {_lp_err}")
+
                         await websocket.send_json({"type": "tool_call", **data})
+
                         # Save completed tool calls to DB so they persist in chat history
                         if data.get("status") == "done":
                             try:
@@ -696,7 +800,7 @@ async def websocket_chat(
                                     _tc_db.add(tc_msg)
                                     await _tc_db.commit()
                             except Exception as _tc_err:
-                                print(f"[WS] Failed to save tool_call: {_tc_err}")
+                                logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
                     
                     # Track thinking content for storage
                     thinking_content = []
@@ -716,6 +820,7 @@ async def websocket_chat(
                         role_description,
                         agent_id=agent_id,
                         user_id=user_id,
+                        session_id=conv_id,
                         on_chunk=stream_to_ws,
                         on_tool_call=tool_call_to_ws,
                         on_thinking=thinking_to_ws,
@@ -731,7 +836,7 @@ async def websocket_chat(
                                 websocket.receive_json(), timeout=0.5
                             )
                             if msg.get("type") == "abort":
-                                print(f"[WS] Abort received, cancelling LLM task")
+                                logger.info(f"[WS] Abort received, cancelling LLM task")
                                 llm_task.cancel()
                                 aborted = True
                                 break
@@ -755,10 +860,10 @@ async def websocket_chat(
                             assistant_response = partial_text + "\n\n*[Generation stopped]*"
                         else:
                             assistant_response = "*[Generation stopped]*"
-                        print(f"[WS] LLM aborted, partial: {assistant_response[:80]}")
+                        logger.info(f"[WS] LLM aborted, partial: {assistant_response[:80]}")
                     else:
                         assistant_response = await llm_task
-                        print(f"[WS] LLM response: {assistant_response[:80]}")
+                        logger.info(f"[WS] LLM response: {assistant_response[:80]}")
 
                     # Update last_active_at
                     from datetime import datetime, timezone as tz
@@ -783,12 +888,12 @@ async def websocket_chat(
                 except WebSocketDisconnect:
                     raise
                 except Exception as e:
-                    print(f"[WS] LLM error: {e}")
+                    logger.error(f"[WS] LLM error: {e}")
                     import traceback
                     traceback.print_exc()
                     # Runtime fallback: primary model failed -> retry with fallback model
                     if fallback_llm_model:
-                        print(f"[WS] Primary model failed, retrying with fallback: {fallback_llm_model.model}")
+                        logger.info(f"[WS] Primary model failed, retrying with fallback: {fallback_llm_model.model}")
                         try:
                             await websocket.send_json({"type": "info", "content": f"Primary model error, switching to fallback model ({fallback_llm_model.model})..."})
                             assistant_response = await call_llm(
@@ -798,14 +903,15 @@ async def websocket_chat(
                                 role_description,
                                 agent_id=agent_id,
                                 user_id=user_id,
+                                session_id=conv_id,
                                 on_chunk=stream_to_ws,
                                 on_tool_call=tool_call_to_ws,
                                 on_thinking=thinking_to_ws,
                                 supports_vision=getattr(fallback_llm_model, 'supports_vision', False),
                             )
-                            print(f"[WS] Fallback LLM response: {assistant_response[:80]}")
+                            logger.info(f"[WS] Fallback LLM response: {assistant_response[:80]}")
                         except Exception as e2:
-                            print(f"[WS] Fallback LLM also failed: {e2}")
+                            logger.error(f"[WS] Fallback LLM also failed: {e2}")
                             traceback.print_exc()
                             assistant_response = f"[LLM call error] Primary: {str(e)[:100]} | Fallback: {str(e2)[:100]}"
                     else:
@@ -835,9 +941,9 @@ async def websocket_chat(
                             task_id = task.id
                         _asyncio.create_task(execute_task(task_id, agent_id))
                         assistant_response += f"\n\n📋 Task synced to task board: [{task_title}]"
-                        print(f"[WS] Created task: {task_title}")
+                        logger.info(f"[WS] Created task: {task_title}")
                     except Exception as e:
-                        print(f"[WS] Failed to create task: {e}")
+                        logger.error(f"[WS] Failed to create task: {e}")
 
             # Add assistant response to conversation
             conversation.append({"role": "assistant", "content": assistant_response})
@@ -854,7 +960,7 @@ async def websocket_chat(
                 )
                 db.add(asst_msg)
                 await db.commit()
-            print("[WS] Assistant message saved")
+            logger.info("[WS] Assistant message saved")
 
             # Send done signal with final content (for non-streaming clients)
             await websocket.send_json({
@@ -862,13 +968,13 @@ async def websocket_chat(
                 "role": "assistant",
                 "content": assistant_response,
             })
-            print("[WS] Response done sent to client")
+            logger.info("[WS] Response done sent to client")
 
     except WebSocketDisconnect:
-        print(f"[WS] Client disconnected: {agent_name}")
+        logger.info(f"[WS] Client disconnected: {agent_name}")
         manager.disconnect(agent_id_str, websocket)
     except Exception as e:
-        print(f"[WS] Error in message loop: {type(e).__name__}: {e}")
+        logger.error(f"[WS] Error in message loop: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         manager.disconnect(agent_id_str, websocket)

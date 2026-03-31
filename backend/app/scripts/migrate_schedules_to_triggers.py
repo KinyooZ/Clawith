@@ -10,6 +10,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
+from loguru import logger
 from sqlalchemy import select
 
 from app.database import async_session
@@ -25,7 +26,7 @@ async def migrate():
         schedules = result.scalars().all()
 
         if not schedules:
-            print("No schedules found to migrate.")
+            logger.info("No schedules found to migrate.")
             return
 
         migrated = 0
@@ -39,7 +40,7 @@ async def migrate():
                 )
             )
             if existing.scalar_one_or_none():
-                print(f"  ⏭️  Skip: '{s.name}' already migrated")
+                logger.info(f"  Skip: '{s.name}' already migrated")
                 skipped += 1
                 continue
 
@@ -54,12 +55,14 @@ async def migrate():
                 last_fired_at=s.last_run_at,
             )
             db.add(trigger)
+            # Disable the source schedule so it won't be re-migrated
+            # if the user deletes the trigger and this script runs again
+            s.is_enabled = False
             migrated += 1
-            print(f"  ✅ Migrated: '{s.name}' → cron({s.cron_expr})")
+            logger.info(f"  Migrated: '{s.name}' -> cron({s.cron_expr})")
 
         await db.commit()
-        print(f"\n{'='*40}")
-        print(f"Migration complete: {migrated} migrated, {skipped} skipped")
+        logger.info(f"Migration complete: {migrated} migrated, {skipped} skipped")
 
 
 if __name__ == "__main__":

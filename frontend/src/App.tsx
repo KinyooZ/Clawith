@@ -1,8 +1,10 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuthStore } from './stores';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { authApi } from './services/api';
 import Login from './pages/Login';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 import CompanySetup from './pages/CompanySetup';
 import Layout from './pages/Layout';
 import Dashboard from './pages/Dashboard';
@@ -14,6 +16,7 @@ import Messages from './pages/Messages';
 import EnterpriseSettings from './pages/EnterpriseSettings';
 import InvitationCodes from './pages/InvitationCodes';
 import AdminCompanies from './pages/AdminCompanies';
+import SSOEntry from './pages/SSOEntry';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -28,6 +31,10 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 function NotificationBar() {
     const [config, setConfig] = useState<{ enabled: boolean; text: string } | null>(null);
     const [dismissed, setDismissed] = useState(false);
+    
+    const textRef = useRef<HTMLSpanElement>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const [isMarquee, setIsMarquee] = useState(false);
 
     useEffect(() => {
         fetch('/api/enterprise/system-settings/notification_bar/public')
@@ -55,6 +62,24 @@ function NotificationBar() {
         return () => { document.body.classList.remove('has-notification-bar'); };
     }, [isVisible]);
 
+    // Dynamic marquee if text is too wide
+    useEffect(() => {
+        if (!isVisible) return;
+        const checkWidth = () => {
+            if (textRef.current && containerRef.current) {
+                // Determine if text is wider than its container
+                setIsMarquee(textRef.current.scrollWidth > containerRef.current.clientWidth);
+            }
+        };
+        // Small delay to ensure DOM is fully rendered
+        const timer = setTimeout(checkWidth, 100);
+        window.addEventListener('resize', checkWidth);
+        return () => {
+            clearTimeout(timer);
+            window.removeEventListener('resize', checkWidth);
+        };
+    }, [isVisible, config?.text]);
+
     if (!isVisible) return null;
 
     const handleDismiss = () => {
@@ -63,9 +88,21 @@ function NotificationBar() {
         setDismissed(true);
     };
 
+    // Calculate dynamic duration: longer text = longer animation so speed is consistent
+    const duration = config ? Math.max(20, config.text.length * 0.2) + 's' : '20s';
+
     return (
         <div className="notification-bar">
-            <span className="notification-bar-text">{config!.text}</span>
+            <div className="notification-bar-inner" ref={containerRef}>
+                <span 
+                    ref={textRef} 
+                    className={`notification-bar-text ${isMarquee ? 'marquee' : ''}`}
+                    title={config!.text}
+                    style={isMarquee ? { animationDuration: duration } : {}}
+                >
+                    {config!.text}
+                </span>
+            </div>
             <button className="notification-bar-close" onClick={handleDismiss} aria-label="Close">✕</button>
         </div>
     );
@@ -104,6 +141,9 @@ export default function App() {
             <NotificationBar />
             <Routes>
                 <Route path="/login" element={<Login />} />
+                <Route path="/forgot-password" element={<ForgotPassword />} />
+                <Route path="/reset-password" element={<ResetPassword />} />
+                <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                     <Route index element={<Navigate to="/plaza" replace />} />
@@ -115,7 +155,7 @@ export default function App() {
                     <Route path="messages" element={<Messages />} />
                     <Route path="enterprise" element={<EnterpriseSettings />} />
                     <Route path="invitations" element={<InvitationCodes />} />
-                    <Route path="admin/companies" element={<AdminCompanies />} />
+                    <Route path="admin/platform-settings" element={<AdminCompanies />} />
                 </Route>
             </Routes>
         </>

@@ -3,7 +3,6 @@
 import hashlib
 import hmac
 import json
-import logging
 import os
 import time
 import uuid
@@ -11,6 +10,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +31,6 @@ from pathlib import Path as _Path
 import asyncio as _asyncio
 import random as _random
 
-logger = logging.getLogger(__name__)
 settings = get_settings()
 
 router = APIRouter(tags=["microsoft_teams"])
@@ -480,14 +479,20 @@ async def teams_event_webhook(
             await db.flush()
         platform_user_id = _platform_user.id
 
+        # Detect group vs P2P chat
+        _conv_type = activity.get("conversation", {}).get("conversationType", "")
+        _is_group_teams = (_conv_type in ("groupChat", "channel"))
+
         # Find-or-create session for this Teams conversation
         sess = await find_or_create_channel_session(
             db=db,
             agent_id=agent_id,
-            user_id=platform_user_id,
+            user_id=platform_user_id if not _is_group_teams else (agent_obj.creator_id if agent_obj else platform_user_id),
             external_conv_id=conversation_id,
             source_channel="microsoft_teams",
             first_message_title=user_text,
+            is_group=_is_group_teams,
+            group_name=activity.get("conversation", {}).get("name") or (f"Teams Group {conversation_id[:8]}" if _is_group_teams else None),
         )
         session_conv_id = str(sess.id)
 

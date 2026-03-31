@@ -3,7 +3,8 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import select
+from loguru import logger
+from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
@@ -11,6 +12,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
+from app.models.identity import IdentityProvider
 from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResponse, UserOut
 from app.services.feishu_service import feishu_service
 
@@ -19,27 +21,98 @@ router = APIRouter(tags=["feishu"])
 
 # ─── OAuth ──────────────────────────────────────────────
 
+from fastapi.responses import HTMLResponse, Response
+
+@router.get("/auth/feishu/callback")
 @router.post("/auth/feishu/callback", response_model=TokenResponse)
-async def feishu_oauth_callback(code: str, db: AsyncSession = Depends(get_db)):
+async def feishu_oauth_callback(
+    code: str, 
+    state: str = None, 
+    db: AsyncSession = Depends(get_db)
+):
     """Handle Feishu OAuth callback — exchange code for user session."""
+    # Parse state if it's a UUID (session ID) or other context
+    from app.models.identity import SSOScanSession
+    tenant_id = None
+    if state:
+        try:
+            sid = uuid.UUID(state)
+            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+            session = s_res.scalar_one_or_none()
+            if session:
+                tenant_id = session.tenant_id
+        except (ValueError, AttributeError):
+            pass
+
     try:
-        feishu_user = await feishu_service.exchange_code_for_user(code)
+        # Use FeishuAuthProvider instead of legacy feishu_service
+        from app.services.auth_provider import FeishuAuthProvider
+        from app.models.identity import IdentityProvider
+        from app.config import get_settings
+
+        # Get Feishu credentials from settings
+        settings = get_settings()
+        feishu_config = {
+            "app_id": settings.FEISHU_APP_ID,
+            "app_secret": settings.FEISHU_APP_SECRET,
+        }
+
+        # Get or create provider via auth provider
+        provider = None
+        if tenant_id:
+            result = await db.execute(
+                select(IdentityProvider).where(
+                    IdentityProvider.provider_type == "feishu",
+                    IdentityProvider.tenant_id == tenant_id
+                )
+            )
+            provider = result.scalar_one_or_none()
+
+        auth_provider = FeishuAuthProvider(provider=provider, config=feishu_config)
+
+        # Ensure provider exists (will create if not)
+        await auth_provider._ensure_provider(db, tenant_id)
+        provider = auth_provider.provider
+
+        # Exchange code for user info
+        token_data = await auth_provider.exchange_code_for_token(code)
+        access_token = token_data.get("access_token", "")
+        user_info = await auth_provider.get_user_info(access_token)
+
+        # Find or create user
+        user, is_new = await auth_provider.find_or_create_user(db, user_info, tenant_id=tenant_id)
+
+        # Generate JWT token
+        from app.core.security import create_access_token
+        token = create_access_token(str(user.id), user.role)
+
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Feishu auth failed: {e}")
 
-    user, token = await feishu_service.login_or_register(db, feishu_user)
+    # If this is an SSO session, store result and redirect to frontend completion
+    if state:
+        try:
+            sid = uuid.UUID(state)
+            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+            session = s_res.scalar_one_or_none()
+            if session:
+                session.status = "authorized"
+                session.provider_type = "feishu"
+                session.user_id = user.id
+                session.access_token = token
+                session.error_msg = None
+                await db.commit()
+                return HTMLResponse(
+                    f"""<html><head><meta charset="utf-8" /></head>
+                    <body style="font-family: sans-serif; padding: 24px;">
+                        <div>SSO login successful. Redirecting...</div>
+                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
+                    </body></html>"""
+                )
+        except Exception as e:
+            logger.exception("Failed to update SSO session (feishu) %s", e)
+
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
-
-
-@router.post("/auth/feishu/bind")
-async def bind_feishu_account(
-    code: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Bind Feishu account to existing user."""
-    user = await feishu_service.bind_feishu(db, current_user, code)
-    return UserOut.model_validate(user)
 
 
 # ─── Channel Config (per-agent Feishu bot) ──────────────
@@ -187,7 +260,7 @@ async def feishu_event_webhook(
 async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession):
     """Core logic to process feishu events from both webhook and WS client."""
     import json as _json
-    print(f"[Feishu] Event processing for {agent_id}: event_type={body.get('header', {}).get('event_type', 'N/A')}")
+    logger.info(f"[Feishu] Event processing for {agent_id}: event_type={body.get('header', {}).get('event_type', 'N/A')}")
 
     # Deduplicate — Feishu retries on slow responses
     # Only mark as processed AFTER successful handling so retries work on crash
@@ -226,7 +299,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
         chat_type = message.get("chat_type", "p2p")  # p2p or group
         chat_id = message.get("chat_id", "")
 
-        print(f"[Feishu] Received {msg_type} message, chat_type={chat_type}, from={sender_open_id}")
+        logger.info(f"[Feishu] Received {msg_type} message, chat_type={chat_type}, from={sender_open_id}")
 
         # ── Normalize post (rich text) → extract text + schedule image downloads ──
         if msg_type == "post":
@@ -278,12 +351,12 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         # Save to workspace
                         _save_path = _upload_dir / f"image_{_ik[-8:]}.jpg"
                         _save_path.write_bytes(_img_bytes)
-                        print(f"[Feishu] Saved post image to {_save_path} ({len(_img_bytes)} bytes)")
+                        logger.info(f"[Feishu] Saved post image to {_save_path} ({len(_img_bytes)} bytes)")
                         # Embed as base64 marker for vision models
                         _b64_data = _b64.b64encode(_img_bytes).decode("ascii")
                         _image_markers.append(f"[image_data:data:image/jpeg;base64,{_b64_data}]")
                     except Exception as _dl_err:
-                        print(f"[Feishu] Failed to download post image {_ik}: {_dl_err}")
+                        logger.error(f"[Feishu] Failed to download post image {_ik}: {_dl_err}")
             # Build final text with embedded images
             if not _extracted_text and _image_markers:
                 _extracted_text = "[用户发送了图片，请看图片内容]"
@@ -293,7 +366,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             # Rewrite as text message so existing handler processes it
             message["content"] = _json_post.dumps({"text": _final_content})
             msg_type = "text"
-            print(f"[Feishu] Normalized post → text='{_extracted_text[:100]}', images={len(_image_markers)}")
+            logger.info(f"[Feishu] Normalized post → text='{_extracted_text[:100]}', images={len(_image_markers)}")
 
         if msg_type in ("file", "image"):
             import asyncio as _asyncio
@@ -312,8 +385,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             if not user_text:
                 return {"code": 0, "msg": "empty message after stripping mentions"}
 
-            print(f"[Feishu] User text: {user_text[:100]}")
-
             # Detect task creation intent
             task_match = re.search(
                 r'(?:创建|新建|添加|建一个|帮我建)(?:一个)?(?:任务|待办|todo)[，,：:\s]*(.+)',
@@ -321,11 +392,11 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             )
 
             # Determine conversation_id for history isolation
-            # Group chats: use chat_id; P2P chats: use sender_open_id
+            # Group chats: use chat_id; P2P chats: prefer user_id (tenant-stable)
             if chat_type == "group" and chat_id:
                 conv_id = f"feishu_group_{chat_id}"
             else:
-                conv_id = f"feishu_p2p_{sender_open_id}"
+                conv_id = f"feishu_p2p_{sender_user_id_from_event or sender_open_id}"
 
             # Load recent conversation history via session (session UUID may already exist)
             from app.models.audit import ChatMessage
@@ -376,13 +447,13 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             headers={"Authorization": f"Bearer {_app_token}"},
                         )
                         _user_data = _user_resp.json()
-                        print(f"[Feishu] Sender resolve: code={_user_data.get('code')}, msg={_user_data.get('msg', '')}")
+                        logger.info(f"[Feishu] Sender resolve: code={_user_data.get('code')}, msg={_user_data.get('msg', '')}")
                         if _user_data.get("code") == 0:
                             _user_info = _user_data.get("data", {}).get("user", {})
                             sender_name = _user_info.get("name", "")
                             sender_user_id_feishu = _user_info.get("user_id", "")
                             sender_email = _user_info.get("email", "") or _user_info.get("enterprise_email", "")
-                            print(f"[Feishu] Resolved sender: {sender_name} (user_id={sender_user_id_feishu})")
+                            logger.info(f"[Feishu] Resolved sender: {sender_name} (user_id={sender_user_id_feishu})")
                             # Cache sender info so feishu_user_search can find them by name
                             if sender_name and sender_open_id:
                                 try:
@@ -411,62 +482,121 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                     _cache.write_text(_cj.dumps(
                                         {"ts": _ct.time(), "users": list(_users.values())},
                                         ensure_ascii=False,
-                                    ))
+                                    ), encoding="utf-8")
                                     import os as _os
                                     _os.chmod(str(_cache), 0o600)
                                 except Exception as _ce:
-                                    print(f"[Feishu] Cache write failed: {_ce}")
+                                    logger.error(f"[Feishu] Cache write failed: {_ce}")
             except Exception as e:
-                print(f"[Feishu] Failed to resolve sender: {e}")
+                logger.error(f"[Feishu] Failed to resolve sender: {e}")
 
-            # Look up platform user by feishu_user_id or feishu_open_id
-            if sender_user_id_feishu:
-                u_result = await db.execute(
-                    select(User).where(User.feishu_user_id == sender_user_id_feishu)
+            # --- Get or Create Feishu Identity Provider ---
+            # Use tenant scoping
+            provider_query = select(IdentityProvider).where(
+                IdentityProvider.provider_type == "feishu",
+                IdentityProvider.tenant_id == (agent_obj.tenant_id if agent_obj else None)
+            )
+            provider_result = await db.execute(provider_query)
+            provider = provider_result.scalars().first()
+            
+            if not provider:
+                provider = IdentityProvider(
+                    provider_type="feishu",
+                    name="Feishu",
+                    is_active=True,
+                    config={"app_id": config.app_id, "app_secret": config.app_secret},
+                    tenant_id=agent_obj.tenant_id if agent_obj else None
                 )
-                found_user = u_result.scalar_one_or_none()
-                if found_user:
-                    platform_user_id = found_user.id
-                    print(f"[Feishu] Matched user by feishu_user_id: {found_user.username}")
+                db.add(provider)
+                await db.flush()
 
-            if platform_user_id == creator_id and sender_open_id:
-                # Try by feishu_open_id (if same app ID was used for SSO)
-                u_result2 = await db.execute(
-                    select(User).where(User.feishu_open_id == sender_open_id)
+            # Look up platform user by OrgMember
+            from app.models.org import OrgMember
+            if sender_user_id_feishu or sender_open_id:
+                member_query = select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.tenant_id == agent_obj.tenant_id if agent_obj else None,
+                    OrgMember.status == "active",
+                    or_(
+                        OrgMember.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
+                        OrgMember.open_id == sender_open_id if sender_open_id else False,
+                        OrgMember.external_id == sender_open_id if sender_open_id else False
+                    )
                 )
-                found_user2 = u_result2.scalar_one_or_none()
-                if found_user2:
-                    platform_user_id = found_user2.id
-                    print(f"[Feishu] Matched user by feishu_open_id: {found_user2.username}")
+                member_result = await db.execute(member_query)
+                member = member_result.scalars().first()
+                if member and member.user_id:
+                    platform_user_id = member.user_id
+                    logger.info(f"[Feishu] Matched user via OrgMember: {platform_user_id}")
 
             # Auto-create user if not found and we have sender info
             if platform_user_id == creator_id and sender_name:
                 from app.core.security import hash_password
                 new_username = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
-                new_user = User(
-                    username=new_username,
-                    email=f"{new_username}@feishu.local",
-                    password_hash=hash_password(_uuid.uuid4().hex),  # random password
-                    display_name=sender_name,
-                    role="member",
-                    feishu_open_id=sender_open_id,
-                    feishu_user_id=sender_user_id_feishu or None,
-                    tenant_id=agent_obj.tenant_id if agent_obj else None,
+                
+                # Check if a user with this username already exists
+                existing_user_query = select(User).where(User.username == new_username)
+                existing_user_result = await db.execute(existing_user_query)
+                existing_user = existing_user_result.scalars().first()
+                
+                if existing_user:
+                    platform_user_id = existing_user.id
+                    logger.info(f"[Feishu] Found existing user by username: {new_username}")
+                else:
+                    new_user = User(
+                        username=new_username,
+                        email=f"{new_username}@feishu.local",
+                        password_hash=hash_password(_uuid.uuid4().hex),  # random password
+                        display_name=sender_name,
+                        role="member",
+                        external_id=sender_user_id_feishu,
+                        feishu_user_id=sender_user_id_feishu or None,
+                        tenant_id=agent_obj.tenant_id if agent_obj else None,
+                    )
+                    db.add(new_user)
+                    await db.flush()
+                    platform_user_id = new_user.id
+                    logger.info(f"[Feishu] Auto-created user: {sender_name} -> {new_username}")
+            # Ensure OrgMember exists and is linked
+            member_check = await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.tenant_id == agent_obj.tenant_id if agent_obj else None,
+                    OrgMember.status == "active",
+                    or_(
+                        OrgMember.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
+                        OrgMember.open_id == sender_open_id if sender_open_id else False
+                    )
                 )
-                db.add(new_user)
-                await db.flush()
-                platform_user_id = new_user.id
-                print(f"[Feishu] Auto-created user: {sender_name} -> {new_username}")
+            )
+            member = member_check.scalars().first()
+            if not member:
+                member = OrgMember(
+                    name=sender_name or f"Feishu User {sender_open_id[:8]}",
+                    open_id=sender_open_id,
+                    external_id=sender_user_id_feishu,
+                    provider_id=provider.id,
+                    user_id=platform_user_id,
+                    tenant_id=agent_obj.tenant_id if agent_obj else None
+                )
+                db.add(member)
+            elif not member.user_id:
+                member.user_id = platform_user_id
+            
+            await db.flush()
 
             # ── Find-or-create a ChatSession via external_conv_id (DB-based, no cache needed) ──
             from datetime import datetime as _dt, timezone as _tz
+            _is_group = (chat_type == "group")
             _sess = await find_or_create_channel_session(
                 db=db,
                 agent_id=agent_id,
-                user_id=platform_user_id,
+                user_id=platform_user_id if not _is_group else creator_id,
                 external_conv_id=conv_id,
                 source_channel="feishu",
                 first_message_title=user_text,
+                is_group=_is_group,
+                group_name=f"Feishu Group {chat_id[:8]}" if _is_group else None,
             )
             session_conv_id = str(_sess.id)
 
@@ -513,9 +643,9 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         f"如果用户的指令涉及这篇文章、这个文件、这份文档等，"
                         f"请立即调用 read_document(path=\"{_ws_rel_path}\") 读取内容，不要先用 list_files 验证，直接读取即可。]"
                     )
-                    print(f"[Feishu] Injected recent file hint: {_ws_rel_path}")
+                    logger.info(f"[Feishu] Injected recent file hint: {_ws_rel_path}")
             except Exception as _fe:
-                print(f"[Feishu] File injection error: {_fe}")
+                logger.error(f"[Feishu] File injection error: {_fe}")
 
             # Set sender open_id contextvar so calendar tool can auto-invite the requester
             from app.services.agent_tools import channel_feishu_sender_open_id as _cfso
@@ -589,7 +719,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     )
                 msg_id_for_patch = init_resp.get("data", {}).get("message_id")
             except Exception as e:
-                print(f"[Feishu] Failed to send init stream card: {e}")
+                logger.error(f"[Feishu] Failed to send init stream card: {e}")
 
             _stream_buffer = []
             _thinking_buffer = []
@@ -660,7 +790,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             )
             _cfs.reset(_cfs_token)
             _cfso.reset(_cfso_token)
-            print(f"[Feishu] LLM reply: {reply_text[:100]}")
+            logger.info(f"[Feishu] LLM reply: {reply_text[:100]}")
 
             # Send final card update or fallback text
             if msg_id_for_patch:
@@ -686,7 +816,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             json.dumps({"text": reply_text}),
                         )
                 except Exception as e:
-                    print(f"[Feishu] Failed to send fallback message: {e}")
+                    logger.error(f"[Feishu] Failed to send fallback message: {e}")
 
             # Log activity
             from app.services.activity_logger import log_activity
@@ -719,9 +849,9 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         await db.refresh(task_obj)
                         _asyncio.create_task(execute_task(task_obj.id, agent_id))
                         reply_text += f"\n\n📋 已同步创建任务到任务面板：【{task_title}】"
-                        print(f"[Feishu] Created task: {task_title}")
+                        logger.info(f"[Feishu] Created task: {task_title}")
                     except Exception as e:
-                        print(f"[Feishu] Failed to create task: {e}")
+                        logger.error(f"[Feishu] Failed to create task: {e}")
 
             # Save assistant reply to history (use platform_user_id so messages stay in one session)
             db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant", content=reply_text, conversation_id=session_conv_id))
@@ -771,7 +901,7 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
         res_type = "file"
 
     if not file_key:
-        print(f"[Feishu] No file_key in {msg_type} message")
+        logger.warning(f"[Feishu] No file_key in {msg_type} message")
         return
 
     # Resolve workspace upload dir
@@ -786,9 +916,9 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
             config.app_id, config.app_secret, message_id, file_key, res_type
         )
         save_path.write_bytes(file_bytes)
-        print(f"[Feishu] Saved {msg_type} to {save_path} ({len(file_bytes)} bytes)")
+        logger.info(f"[Feishu] Saved {msg_type} to {save_path} ({len(file_bytes)} bytes)")
     except Exception as e:
-        print(f"[Feishu] Failed to download {msg_type}: {e}")
+        logger.error(f"[Feishu] Failed to download {msg_type}: {e}")
         err_tip = "抱歉，文件下载失败。可能原因：机器人缺少 `im:resource` 权限（文件读取）。\n请在飞书开放平台 → 权限管理 → 批量导入权限 JSON → 重新发布机器人版本后重试。"
         try:
             import json as _j
@@ -797,7 +927,7 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
             else:
                 await feishu_service.send_message(config.app_id, config.app_secret, sender_open_id, "text", _j.dumps({"text": err_tip}))
         except Exception as e2:
-            print(f"[Feishu] Also failed to send error tip: {e2}")
+            logger.error(f"[Feishu] Also failed to send error tip: {e2}")
         return
 
     # Resolve platform user and session using a fresh db session
@@ -805,32 +935,99 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
 
-        _un = f"feishu_{sender_open_id[:16]}"
-        _ur = await db.execute(_select(UserModel).where(UserModel.username == _un))
-        _pu = _ur.scalar_one_or_none()
+        # Resolve sender identity: prefer user_id from message event
+        sender_user_id_feishu = ""
+        try:
+            # Try to extract user_id from the original message event
+            import httpx as _hx
+            async with _hx.AsyncClient() as _fc:
+                _tr = await _fc.post(
+                    "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal",
+                    json={"app_id": config.app_id, "app_secret": config.app_secret},
+                )
+                _at = _tr.json().get("app_access_token", "")
+                if _at:
+                    _ur = await _fc.get(
+                        f"https://open.feishu.cn/open-apis/contact/v3/users/{sender_open_id}",
+                        params={"user_id_type": "open_id"},
+                        headers={"Authorization": f"Bearer {_at}"},
+                    )
+                    _ud = _ur.json()
+                    if _ud.get("code") == 0:
+                        sender_user_id_feishu = _ud.get("data", {}).get("user", {}).get("user_id", "")
+        except Exception:
+            pass
+
+        # Find platform user: prefer OrgMember linkage, then feishu_user_id, then username
+        _pu = None
+        if agent_obj:
+            from app.models.identity import IdentityProvider as IdentityProviderModel
+            from app.models.org import OrgMember as OrgMemberModel
+            _pr = await db.execute(
+                _select(IdentityProviderModel).where(
+                    IdentityProviderModel.provider_type == "feishu",
+                    IdentityProviderModel.tenant_id == agent_obj.tenant_id,
+                )
+            )
+            _provider = _pr.scalars().first()
+            if _provider and (sender_user_id_feishu or sender_open_id):
+                _mr = await db.execute(
+                    _select(OrgMemberModel).where(
+                        OrgMemberModel.provider_id == _provider.id,
+                        OrgMemberModel.tenant_id == agent_obj.tenant_id,
+                        OrgMemberModel.status == "active",
+                        or_(
+                            OrgMemberModel.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
+                            OrgMemberModel.open_id == sender_open_id if sender_open_id else False,
+                        )
+                    )
+                )
+                _member = _mr.scalars().first()
+                if _member and _member.user_id:
+                    _ur = await db.execute(_select(UserModel).where(UserModel.id == _member.user_id))
+                    _pu = _ur.scalars().first()
+        if sender_user_id_feishu:
+            _ur = await db.execute(_select(UserModel).where(UserModel.feishu_user_id == sender_user_id_feishu))
+            _pu = _ur.scalars().first()
         if not _pu:
+            _un = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
+            _ur = await db.execute(_select(UserModel).where(UserModel.username == _un))
+            _pu = _ur.scalars().first()
+        if not _pu:
+            _un = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
             _pu = UserModel(
                 username=_un, email=f"{_un}@feishu.local",
                 password_hash=hash_password(_uuid.uuid4().hex),
                 display_name=f"Feishu {sender_open_id[:8]}",
-                role="member", feishu_open_id=sender_open_id,
+                role="member",
+                external_id=sender_user_id_feishu,
+                feishu_user_id=sender_user_id_feishu or None,
                 tenant_id=agent_obj.tenant_id if agent_obj else None,
             )
             db.add(_pu)
             await db.flush()
         platform_user_id = _pu.id
 
-        # Conv ID
+        # Conv ID — prefer user_id for session continuity
         if chat_type == "group" and chat_id:
             conv_id = f"feishu_group_{chat_id}"
         else:
-            conv_id = f"feishu_p2p_{sender_open_id}"
+            conv_id = f"feishu_p2p_{sender_user_id_feishu or sender_open_id}"
 
         # Find-or-create session
+        _is_group_file = (chat_type == "group")
+        # For group file sessions, use agent creator as placeholder user_id
+        _file_user_id = platform_user_id
+        if _is_group_file:
+            _ag_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
+            _ag_obj = _ag_r.scalar_one_or_none()
+            _file_user_id = _ag_obj.creator_id if _ag_obj else platform_user_id
         _sess = await find_or_create_channel_session(
-            db=db, agent_id=agent_id, user_id=platform_user_id,
+            db=db, agent_id=agent_id, user_id=_file_user_id,
             external_conv_id=conv_id, source_channel="feishu",
             first_message_title=f"[文件] {filename}",
+            is_group=_is_group_file,
+            group_name=f"Feishu Group {chat_id[:8]}" if _is_group_file else None,
         )
         session_conv_id = str(_sess.id)
 
@@ -881,7 +1078,7 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
             )
             _patch_msg_id = _init_resp.get("data", {}).get("message_id")
         except Exception as _e_init:
-            print(f"[Feishu] Failed to send init card for image: {_e_init}")
+            logger.error(f"[Feishu] Failed to send init card for image: {_e_init}")
 
         _img_stream_buf = []
         _img_last_flush = _time_img.time()
@@ -909,7 +1106,7 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
                 user_id=platform_user_id, on_chunk=_img_on_chunk,
             )
 
-        print(f"[Feishu] Image LLM reply: {reply_text[:100]}")
+        logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
 
         # Send final card or fallback text
         if _patch_msg_id:
@@ -928,7 +1125,7 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
                     json.dumps({"text": reply_text}), receive_id_type=_rid_type,
                 )
             except Exception as _e_fb:
-                print(f"[Feishu] Failed to send image reply: {_e_fb}")
+                logger.error(f"[Feishu] Failed to send image reply: {_e_fb}")
 
         # Save assistant reply in DB
         async with _async_session() as _db_save:
@@ -957,7 +1154,7 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
                 json.dumps({"text": ack}),
             )
     except Exception as e:
-        print(f"[Feishu] Failed to send ack: {e}")
+        logger.error(f"[Feishu] Failed to send ack: {e}")
 
     # Store ack in DB
     async with _async_session() as db2:
@@ -982,9 +1179,9 @@ async def _download_post_images(agent_id, config, message_id, image_keys):
             )
             save_path = upload_dir / f"image_{ik[-8:]}.jpg"
             save_path.write_bytes(file_bytes)
-            print(f"[Feishu] Saved post image to {save_path} ({len(file_bytes)} bytes)")
+            logger.info(f"[Feishu] Saved post image to {save_path} ({len(file_bytes)} bytes)")
         except Exception as e:
-            print(f"[Feishu] Failed to download post image {ik}: {e}")
+                logger.error(f"[Feishu] Failed to download post image {ik}: {e}")
 
 
 async def _call_agent_llm(db: AsyncSession, agent_id: uuid.UUID, user_text: str, history: list[dict] | None = None, user_id=None, on_chunk=None, on_thinking=None) -> str:
@@ -1006,31 +1203,38 @@ async def _call_agent_llm(db: AsyncSession, agent_id: uuid.UUID, user_text: str,
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
 
-    # Load primary model
+    # Load primary model (skip if disabled by admin)
     model = None
     if agent.primary_model_id:
         model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
         model = model_result.scalar_one_or_none()
+        if model and not model.enabled:
+            logger.info(f"[Channel] Primary model {model.model} is disabled, skipping")
+            model = None
 
-    # Load fallback model
+    # Load fallback model (skip if disabled by admin)
     fallback_model = None
     if agent.fallback_model_id:
         fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
         fallback_model = fb_result.scalar_one_or_none()
+        if fallback_model and not fallback_model.enabled:
+            logger.info(f"[Channel] Fallback model {fallback_model.model} is disabled, skipping")
+            fallback_model = None
 
     # Config-level fallback: primary missing -> use fallback
     if not model and fallback_model:
         model = fallback_model
         fallback_model = None
-        print(f"[Channel] Primary model unavailable, using fallback: {model.model}")
+        logger.warning(f"[Channel] Primary model unavailable, using fallback: {model.model}")
 
     if not model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
 
     # Build conversation messages (without system prompt — call_llm adds it)
     messages: list[dict] = []
+    ctx_size = agent.context_window_size or 100
     if history:
-        messages.extend(history[-10:])
+        messages.extend(history[-ctx_size:])
     messages.append({"role": "user", "content": user_text})
 
     # Use actual user_id so the system prompt knows who it's chatting with
@@ -1053,10 +1257,10 @@ async def _call_agent_llm(db: AsyncSession, agent_id: uuid.UUID, user_text: str,
         import traceback
         traceback.print_exc()
         error_msg = str(e) or repr(e)
-        print(f"[LLM] Primary model error: {error_msg}")
+        logger.error(f"[LLM] Primary model error: {error_msg}")
         # Runtime fallback: primary model failed -> retry with fallback model
         if fallback_model:
-            print(f"[LLM] Retrying with fallback model: {fallback_model.model}")
+            logger.info(f"[LLM] Retrying with fallback model: {fallback_model.model}")
             try:
                 reply = await call_llm(
                     fallback_model,
@@ -1074,5 +1278,3 @@ async def _call_agent_llm(db: AsyncSession, agent_id: uuid.UUID, user_text: str,
                 traceback.print_exc()
                 return f"⚠️ 调用模型出错: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
         return f"⚠️ 调用模型出错: {error_msg[:150]}"
-
-

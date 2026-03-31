@@ -1,16 +1,17 @@
-<h1 align="center">🦞 Clawith — OpenClaw for Teams</h1>
-
 <p align="center">
-  <em>OpenClaw empowers individuals.</em><br/>
-  <em>Clawith scales it to frontier organizations.</em>
+  <img src="assets/Clawith_slogan.png" alt="Clawith — OpenClaw for Teams" width="800" />
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0 License" />
-  <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python" />
-  <img src="https://img.shields.io/badge/React-19-61DAFB.svg" alt="React" />
-  <img src="https://img.shields.io/badge/FastAPI-0.115+-009688.svg" alt="FastAPI" />
-  <a href="https://discord.gg/3AKMBM2G"><img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://www.clawith.ai/blog/clawith-technical-whitepaper"><img src="https://img.shields.io/badge/Technical%20Whitepaper-Read-8A2BE2" alt="Technical Whitepaper" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0 License" /></a>
+  <a href="https://github.com/dataelement/Clawith/stargazers"><img src="https://img.shields.io/github/stars/dataelement/Clawith?style=flat&color=gold" alt="GitHub Stars" /></a>
+  <a href="https://github.com/dataelement/Clawith/network/members"><img src="https://img.shields.io/github/forks/dataelement/Clawith?style=flat&color=slateblue" alt="GitHub Forks" /></a>
+  <a href="https://github.com/dataelement/Clawith/commits/main"><img src="https://img.shields.io/github/last-commit/dataelement/Clawith?style=flat&color=green" alt="Last Commit" /></a>
+  <a href="https://github.com/dataelement/Clawith/graphs/contributors"><img src="https://img.shields.io/github/contributors/dataelement/Clawith?style=flat&color=orange" alt="Contributors" /></a>
+  <a href="https://github.com/dataelement/Clawith/issues"><img src="https://img.shields.io/github/issues/dataelement/Clawith?style=flat" alt="Issues" /></a>
+  <a href="https://x.com/ClawithHQ"><img src="https://img.shields.io/badge/𝕏-Follow-000000?logo=x&logoColor=white" alt="Follow on X" /></a>
+  <a href="https://discord.gg/NRNHZkyDcG"><img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
 </p>
 
 <p align="center">
@@ -155,6 +156,39 @@ Agent workspace files (soul.md, memory, skills, workspace files) are stored in `
 
 The first user to register automatically becomes the **platform admin**. Open the app, click "Register", and create your account.
 
+### System Email and Password Reset
+
+Clawith can send platform-owned emails for password reset and optional broadcast delivery. Configure SMTP in `.env`:
+
+```bash
+PUBLIC_BASE_URL=http://localhost:3008
+SYSTEM_EMAIL_FROM_ADDRESS=bot@example.com
+SYSTEM_EMAIL_FROM_NAME=Clawith
+SYSTEM_SMTP_HOST=smtp.example.com
+SYSTEM_SMTP_PORT=465
+SYSTEM_SMTP_USERNAME=bot@example.com
+SYSTEM_SMTP_PASSWORD=your-app-password
+SYSTEM_SMTP_SSL=true
+SYSTEM_SMTP_TIMEOUT_SECONDS=15
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=30
+```
+
+`PUBLIC_BASE_URL` must point to the user-facing frontend because reset links are generated as `/reset-password?token=...`.
+In production, set it to your public HTTPS domain (for example `https://app.example.com`), not a localhost address.
+
+Quick local validation:
+
+```bash
+cd backend && .venv/bin/python -m pytest tests/test_password_reset_and_notifications.py
+cd frontend && npm run build
+```
+
+Manual flow:
+1. Open `http://localhost:3008/login`
+2. Click `Forgot password?`
+3. Submit a registered email
+4. Open the emailed reset link and set a new password
+
 ### Network Troubleshooting
 
 If `git clone` is slow or times out:
@@ -200,7 +234,7 @@ Change default passwords · Set strong `SECRET_KEY` / `JWT_SECRET_KEY` · Enable
 
 ## 💬 Community
 
-Join our [Discord server](https://discord.gg/3AKMBM2G) to chat with the team, ask questions, share feedback, or just hang out!
+Join our [Discord server](https://discord.gg/NRNHZkyDcG) to chat with the team, ask questions, share feedback, or just hang out!
 
 You can also scan the QR code below to join our community on mobile:
 

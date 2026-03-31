@@ -9,7 +9,7 @@ export default function InvitationCodes() {
     const [search, setSearch] = useState('');
     const pageSize = 20;
     const [batchCount, setBatchCount] = useState(5);
-    const [maxUses, setMaxUses] = useState(5);
+    const [maxUses, setMaxUses] = useState(1);
     const [creating, setCreating] = useState(false);
     const [toast, setToast] = useState('');
 
@@ -133,7 +133,7 @@ export default function InvitationCodes() {
                         />
                         <button className="btn btn-secondary" onClick={exportCsv}
                             style={{ height: '30px', padding: '0 12px', fontSize: '11px', whiteSpace: 'nowrap' }}>
-                            Export CSV
+                            {t('enterprise.invites.exportCsv')}
                         </button>
                     </div>
                 </div>

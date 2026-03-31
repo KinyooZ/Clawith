@@ -2,6 +2,7 @@
 
 import uuid
 import httpx
+from loguru import logger
 from sqlalchemy import select
 from app.database import async_session
 from app.models.tool import Tool, AgentTool
@@ -129,7 +130,7 @@ async def _search_modelscope_api(query: str, max_results: int) -> list[dict]:
             })
         return results
     except Exception as e:
-        print(f"[ResourceDiscovery] ModelScope search failed: {e}")
+        logger.error(f"[ResourceDiscovery] ModelScope search failed: {e}")
         return []
 
 
@@ -387,11 +388,11 @@ async def import_mcp_from_smithery(
                     }
                     for t in raw_tools if t.get("name")
                 ]
-                print(f"[ResourceDiscovery] Got {len(tools_discovered)} tools from registry for {qualified_name}")
+                logger.info(f"[ResourceDiscovery] Got {len(tools_discovered)} tools from registry for {qualified_name}")
             else:
-                print(f"[ResourceDiscovery] Could not fetch detail for {qualified_name}: HTTP {detail_resp.status_code}")
+                logger.warning(f"[ResourceDiscovery] Could not fetch detail for {qualified_name}: HTTP {detail_resp.status_code}")
     except Exception as e:
-        print(f"[ResourceDiscovery] Could not fetch server detail: {e}")
+        logger.error(f"[ResourceDiscovery] Could not fetch server detail: {e}")
 
     # Step 3: Determine the MCP server URL for runtime execution
     base_mcp_url = deployment_url or f"https://{qualified_name}.run.tools"
@@ -490,6 +491,7 @@ async def import_mcp_from_smithery(
                     mcp_tool_name=mcp_tool["name"],
                     enabled=True,
                     is_default=False,
+                    source="agent",
                 )
                 db.add(tool)
                 await db.flush()
@@ -523,6 +525,7 @@ async def import_mcp_from_smithery(
                 mcp_server_name=display_name,
                 enabled=True,
                 is_default=False,
+                source="agent",
             )
             db.add(tool)
             await db.flush()
@@ -571,9 +574,9 @@ async def import_mcp_direct(
     try:
         client = MCPClient(full_url)
         tools_discovered = await client.list_tools()
-        print(f"[DirectImport] Got {len(tools_discovered)} tools from {mcp_url}")
+        logger.info(f"[DirectImport] Got {len(tools_discovered)} tools from {mcp_url}")
     except Exception as e:
-        print(f"[DirectImport] Could not list tools from {mcp_url}: {e}")
+        logger.error(f"[DirectImport] Could not list tools from {mcp_url}: {e}")
 
     # Config to store in AgentTool
     agent_tool_config = {}
@@ -626,6 +629,7 @@ async def import_mcp_direct(
                     mcp_tool_name=mcp_tool["name"],
                     enabled=True,
                     is_default=False,
+                    source="agent",
                 )
                 db.add(tool)
                 await db.flush()
@@ -652,6 +656,7 @@ async def import_mcp_direct(
                 mcp_server_name=display_name,
                 enabled=True,
                 is_default=False,
+                source="agent",
             )
             db.add(tool)
             await db.flush()
@@ -683,19 +688,19 @@ async def seed_atlassian_rovo_tools(api_key: str) -> None:
     """
     from app.services.mcp_client import MCPClient
 
-    print(f"[AtlassianRovo] Connecting to {ATLASSIAN_ROVO_MCP_URL} ...", flush=True)
+    logger.info(f"[AtlassianRovo] Connecting to {ATLASSIAN_ROVO_MCP_URL} ...")
     try:
         client = MCPClient(ATLASSIAN_ROVO_MCP_URL, api_key=api_key)
         tools_discovered = await client.list_tools()
     except Exception as e:
-        print(f"[AtlassianRovo] ⚠️ Could not list tools: {e}", flush=True)
+        logger.error(f"[AtlassianRovo] Could not list tools: {e}")
         return
 
     if not tools_discovered:
-        print("[AtlassianRovo] ⚠️ No tools returned from server", flush=True)
+        logger.warning("[AtlassianRovo] No tools returned from server")
         return
 
-    print(f"[AtlassianRovo] Discovered {len(tools_discovered)} tools", flush=True)
+    logger.info(f"[AtlassianRovo] Discovered {len(tools_discovered)} tools")
 
     async with async_session() as db:
         upserted = 0
@@ -742,13 +747,14 @@ async def seed_atlassian_rovo_tools(api_key: str) -> None:
                     enabled=True,
                     is_default=False,
                     config={"api_key": api_key},
+                    source="admin",
                 )
                 db.add(tool)
                 upserted += 1
 
         await db.commit()
 
-    print(f"[AtlassianRovo] ✅ Seeded {upserted} new Atlassian Rovo tools", flush=True)
+    logger.info(f"[AtlassianRovo] Seeded {upserted} new Atlassian Rovo tools")
 
 
 async def refresh_atlassian_rovo_api_key(api_key: str) -> None:
@@ -764,5 +770,5 @@ async def refresh_atlassian_rovo_api_key(api_key: str) -> None:
             .values(config={"api_key": api_key})
         )
         await db.commit()
-    print(f"[AtlassianRovo] API key refreshed for all Rovo tools", flush=True)
+    logger.info("[AtlassianRovo] API key refreshed for all Rovo tools")
 

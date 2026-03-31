@@ -9,16 +9,29 @@ from pydantic import BaseModel, EmailStr, Field
 # ─── Auth ───────────────────────────────────────────────
 
 class UserRegister(BaseModel):
-    username: str = Field(min_length=3, max_length=100)
+    username: str = Field(min_length=1, max_length=100)
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     display_name: str | None = None
     invitation_code: str | None = None
+    # SSO registration fields
+    provider: str | None = Field(None, description="Provider type for SSO registration (feishu, dingtalk, etc.)")
+    provider_code: str | None = Field(None, description="OAuth code for SSO registration")
 
 
 class UserLogin(BaseModel):
     username: str
     password: str
+    tenant_id: uuid.UUID | None = None  # Optional: when set, restrict login to users of this tenant
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=512)
+    new_password: str = Field(min_length=6, max_length=128)
 
 
 class TokenResponse(BaseModel):
@@ -36,29 +49,62 @@ class UserOut(BaseModel):
     avatar_url: str | None = None
     role: str
     tenant_id: uuid.UUID | None = None
-    department_id: uuid.UUID | None = None
     title: str | None = None
-    feishu_open_id: str | None = None
+    primary_mobile: str | None = None
+    registration_source: str | None = None
     is_active: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}
 
 
+class IdentityProviderOut(BaseModel):
+    id: uuid.UUID
+    provider_type: str
+    name: str
+    is_active: bool
+    sso_login_enabled: bool = False
+    config: dict | None = None
+    tenant_id: uuid.UUID | None = None
+    updated_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class OAuthAuthorizeResponse(BaseModel):
+    authorization_url: str
+
+
+class OAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
+
+
+class IdentityBindRequest(BaseModel):
+    provider_type: str
+    code: str  # OAuth code for binding
+
+
+class IdentityUnbindRequest(BaseModel):
+    provider_type: str
+
+
 class UserUpdate(BaseModel):
     username: str | None = None
+    email: EmailStr | None = None
     display_name: str | None = None
     avatar_url: str | None = None
     title: str | None = None
-    department_id: uuid.UUID | None = None
+    primary_mobile: str | None = None
 
 
 # ─── Agent ──────────────────────────────────────────────
 
 class AgentCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=2, max_length=100, description="Agent name, 2-100 characters")
     agent_type: str = "native"  # native | openclaw
-    role_description: str = Field(default="", max_length=500)
+    role_description: str = Field(default="", max_length=500, description="Role description, max 500 characters")
     bio: str | None = None
     welcome_message: str | None = None
     avatar_url: str | None = None
@@ -103,12 +149,13 @@ class AgentOut(BaseModel):
     tokens_used_total: int = 0
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
+    context_window_size: int = 100
     max_tool_rounds: int = 50
     max_triggers: int = 20
     min_poll_interval_min: int = 5
     webhook_rate_limit: int = 5
     heartbeat_enabled: bool = True
-    heartbeat_interval_minutes: int = 30
+    heartbeat_interval_minutes: int = 240
     heartbeat_active_hours: str = "09:00-18:00"
     last_heartbeat_at: datetime | None = None
     timezone: str | None = None
@@ -118,6 +165,8 @@ class AgentOut(BaseModel):
     max_llm_calls_per_day: int = 100
     agent_type: str = "native"
     openclaw_last_seen: datetime | None = None
+    has_api_key: bool = False
+    api_key_hash: str | None = None
     created_at: datetime
     last_active_at: datetime | None = None
 
@@ -133,6 +182,7 @@ class AgentUpdate(BaseModel):
     autonomy_policy: dict | None = None
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    context_window_size: int | None = Field(default=None, ge=1, le=500)
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
     max_tool_rounds: int | None = None
@@ -216,30 +266,6 @@ class TaskLogOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ─── Department ─────────────────────────────────────────
-
-class DepartmentCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-    parent_id: uuid.UUID | None = None
-    manager_id: uuid.UUID | None = None
-
-
-class DepartmentOut(BaseModel):
-    id: uuid.UUID
-    name: str
-    parent_id: uuid.UUID | None = None
-    manager_id: uuid.UUID | None = None
-    sort_order: int
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class DepartmentTree(DepartmentOut):
-    children: list["DepartmentTree"] = []
-    member_count: int = 0
-
-
 # ─── LLM ────────────────────────────────────────────────
 
 class LLMModelCreate(BaseModel):
@@ -248,6 +274,7 @@ class LLMModelCreate(BaseModel):
     api_key: str
     base_url: str | None = None
     label: str
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
     max_tokens_per_day: int | None = None
     enabled: bool = True
     supports_vision: bool = False
@@ -259,6 +286,7 @@ class LLMModelUpdate(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
     label: str | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
     max_tokens_per_day: int | None = None
     enabled: bool | None = None
     supports_vision: bool | None = None
@@ -271,6 +299,7 @@ class LLMModelOut(BaseModel):
     model: str
     base_url: str | None = None
     label: str
+    temperature: float | None = None
     api_key_masked: str = ""
     max_tokens_per_day: int | None = None
     enabled: bool
@@ -435,4 +464,3 @@ class GatewaySendMessageRequest(BaseModel):
     target: str  # Name of target person or agent
     content: str = Field(min_length=1)
     channel: str | None = None  # Optional: "feishu", "agent", etc. Auto-detected if omitted.
-

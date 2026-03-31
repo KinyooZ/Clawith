@@ -8,15 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Literal
 
 import httpx
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 # ============================================================================
@@ -28,17 +26,23 @@ class LLMMessage:
     """Unified message format."""
 
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
+    content: str | list | None = None
     tool_calls: list[dict] | None = None
     tool_call_id: str | None = None
     reasoning_content: str | None = None
     reasoning_signature: str | None = None
+    dynamic_content: str | None = None
 
     def to_openai_format(self) -> dict:
         """Convert to OpenAI format."""
         msg: dict[str, Any] = {"role": self.role}
-        if self.content is not None:
-            msg["content"] = self.content
+        
+        content = self.content
+        if self.role == "system" and self.dynamic_content:
+            content = f"{content}\n\n{self.dynamic_content}"
+            
+        if content is not None:
+            msg["content"] = content
         if self.tool_calls:
             msg["tool_calls"] = self.tool_calls
         if self.tool_call_id:
@@ -56,13 +60,39 @@ class LLMMessage:
         
         # Tool response (from user to assistant)
         if role == "tool":
+            # Build tool_result content: support both string and vision array formats
+            if isinstance(self.content, list):
+                # Vision content array: extract text parts and image parts
+                # Anthropic tool_result content supports [{type: "text", text: ...}, {type: "image", source: ...}]
+                tool_content_blocks = []
+                for part in self.content:
+                    if part.get("type") == "text":
+                        tool_content_blocks.append({"type": "text", "text": part.get("text", "")})
+                    elif part.get("type") == "image_url":
+                        # Convert OpenAI image_url format to Anthropic image source format
+                        img_url = part.get("image_url", {}).get("url", "")
+                        if img_url.startswith("data:image/"):
+                            # Parse data URL: data:image/jpeg;base64,xxxxx
+                            header, b64_data = img_url.split(",", 1)
+                            media_type = header.split(":")[1].split(";")[0]  # e.g. image/jpeg
+                            tool_content_blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": b64_data,
+                                }
+                            })
+                result_content = tool_content_blocks if tool_content_blocks else (self.content or "")
+            else:
+                result_content = self.content or ""
             return {
                 "role": "user",
                 "content": [
                     {
                         "type": "tool_result",
                         "tool_use_id": self.tool_call_id,
-                        "content": self.content or ""
+                        "content": result_content,
                     }
                 ]
             }
@@ -165,7 +195,7 @@ class LLMClient(ABC):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
@@ -177,7 +207,7 @@ class LLMClient(ABC):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_chunk: ChunkCallback | None = None,
         on_thinking: ThinkingCallback | None = None,
@@ -236,7 +266,7 @@ class OpenAICompatibleClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         stream: bool = False,
         **kwargs: Any,
@@ -245,9 +275,10 @@ class OpenAICompatibleClient(LLMClient):
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [m.to_openai_format() for m in messages],
-            "temperature": temperature,
             "stream": stream,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
 
         # Request usage stats in streaming responses (OpenAI extension)
         if stream:
@@ -272,10 +303,13 @@ class OpenAICompatibleClient(LLMClient):
         line: str,
         in_think: bool,
         tag_buffer: str,
-    ) -> tuple[LLMStreamChunk, bool, str]:
+        json_buffer: str = "",
+    ) -> tuple[LLMStreamChunk, bool, str, str]:
         """Parse a single SSE line from stream.
 
-        Returns (chunk, new_in_think, new_tag_buffer).
+        Returns (chunk, new_in_think, new_tag_buffer, new_json_buffer).
+        The json_buffer accumulates partial JSON from non-standard APIs that
+        split a single JSON object across multiple data: lines.
         """
         chunk = LLMStreamChunk()
 
@@ -285,17 +319,32 @@ class OpenAICompatibleClient(LLMClient):
         elif line.startswith("data:"):
             data_str = line[5:]
         else:
-            return chunk, in_think, tag_buffer
+            # Non-data lines (comments, event types, empty) — never buffer
+            return chunk, in_think, tag_buffer, json_buffer
 
         data_str = data_str.strip()
+        if not data_str:
+            return chunk, in_think, tag_buffer, json_buffer
+
         if data_str == "[DONE]":
             chunk.is_finished = True
-            return chunk, in_think, tag_buffer
+            return chunk, in_think, tag_buffer, ""
+
+        # Accumulate into json_buffer for split JSON handling
+        if json_buffer:
+            json_buffer += data_str
+        else:
+            json_buffer = data_str
 
         try:
-            data = json.loads(data_str)
+            data = json.loads(json_buffer)
+            json_buffer = ""  # Reset on successful parse
         except json.JSONDecodeError:
-            return chunk, in_think, tag_buffer
+            # Cap buffer at 64KB to prevent memory leaks
+            if len(json_buffer) > 65536:
+                logger.warning("[LLM] JSON buffer exceeded 64KB, discarding")
+                json_buffer = ""
+            return chunk, in_think, tag_buffer, json_buffer
 
         if "error" in data:
             raise LLMError(f"Stream error: {data['error']}")
@@ -306,7 +355,7 @@ class OpenAICompatibleClient(LLMClient):
 
         choices = data.get("choices", [])
         if not choices:
-            return chunk, in_think, tag_buffer
+            return chunk, in_think, tag_buffer, json_buffer
 
         choice = choices[0]
         delta = choice.get("delta", {})
@@ -331,7 +380,7 @@ class OpenAICompatibleClient(LLMClient):
                 chunk.tool_call = tc_delta
                 break  # Return one at a time
 
-        return chunk, in_think, tag_buffer
+        return chunk, in_think, tag_buffer, json_buffer
 
     def _filter_think_tags(
         self, text: str, in_think: bool, tag_buffer: str
@@ -382,7 +431,7 @@ class OpenAICompatibleClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
@@ -417,7 +466,7 @@ class OpenAICompatibleClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_chunk: ChunkCallback | None = None,
         on_thinking: ThinkingCallback | None = None,
@@ -435,6 +484,7 @@ class OpenAICompatibleClient(LLMClient):
 
         in_think = False
         tag_buffer = ""
+        json_buffer = ""  # Buffer for non-standard APIs with split JSON (inspired by PR #120)
 
         max_retries = 3
         client = await self._get_client()
@@ -449,8 +499,8 @@ class OpenAICompatibleClient(LLMClient):
                         raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
 
                     async for line in resp.aiter_lines():
-                        chunk, in_think, tag_buffer = self._parse_stream_line(
-                            line, in_think, tag_buffer
+                        chunk, in_think, tag_buffer, json_buffer = self._parse_stream_line(
+                            line, in_think, tag_buffer, json_buffer
                         )
 
                         if chunk.is_finished:
@@ -501,6 +551,7 @@ class OpenAICompatibleClient(LLMClient):
                     tool_calls_data = []
                     in_think = False
                     tag_buffer = ""
+                    json_buffer = ""
                 else:
                     raise LLMError(f"Connection failed after {max_retries} attempts: {e}")
 
@@ -636,7 +687,7 @@ class OpenAIResponsesClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         stream: bool = False,
         **kwargs: Any,
@@ -645,9 +696,10 @@ class OpenAIResponsesClient(LLMClient):
         payload: dict[str, Any] = {
             "model": self.model,
             "input": self._messages_to_input(messages),
-            "temperature": temperature,
             "stream": stream,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
 
         if max_tokens:
             payload["max_output_tokens"] = max_tokens
@@ -757,7 +809,7 @@ class OpenAIResponsesClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
@@ -789,7 +841,7 @@ class OpenAIResponsesClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_chunk: ChunkCallback | None = None,
         on_thinking: ThinkingCallback | None = None,
@@ -1048,11 +1100,13 @@ class GeminiClient(LLMClient):
                     }],
                 })
 
+        generation_config: dict[str, Any] = {}
+        if temperature is not None:
+            generation_config["temperature"] = temperature
+
         payload: dict[str, Any] = {
             "contents": contents or [{"role": "user", "parts": [{"text": ""}]}],
-            "generationConfig": {
-                "temperature": temperature,
-            },
+            "generationConfig": generation_config,
         }
 
         if max_tokens:
@@ -1147,7 +1201,7 @@ class GeminiClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
@@ -1183,7 +1237,7 @@ class GeminiClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_chunk: ChunkCallback | None = None,
         on_thinking: ThinkingCallback | None = None,
@@ -1331,39 +1385,78 @@ class AnthropicClient(LLMClient):
             "Content-Type": "application/json",
             "x-api-key": self.api_key,
             "anthropic-version": self.API_VERSION,
+            "anthropic-beta": "prompt-caching-2024-07-31",
         }
+
+    def _normalize_base_url(self) -> str:
+        """Normalize base URL by stripping trailing API paths."""
+        url = self.base_url.rstrip("/")
+        if url.endswith("/v1/messages"):
+            url = url[: -len("/v1/messages")]
+        elif url.endswith("/v1/chat/completions"):
+            url = url[: -len("/v1/chat/completions")]
+        elif url.endswith("/v1"):
+            url = url[: -len("/v1")]
+        return url
 
     def _build_payload(
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None,
-        temperature: float,
+        temperature: float | None,
         max_tokens: int | None,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build Anthropic request payload."""
-        system_content = None
+        system_blocks = []
         anthropic_messages = []
 
         for msg in messages:
             if msg.role == "system":
-                system_content = msg.content
+                if msg.content:
+                    system_blocks.append({
+                        "type": "text",
+                        "text": msg.content,
+                        "cache_control": {"type": "ephemeral"}
+                    })
+                if msg.dynamic_content:
+                    system_blocks.append({
+                        "type": "text",
+                        "text": f"\n{msg.dynamic_content}"
+                    })
             else:
                 formatted = msg.to_anthropic_format()
                 if formatted:
                     anthropic_messages.append(formatted)
 
+        # In Anthropic prompt caching, we also want to cache_control the last user message
+        # So we add cache_control to the very last message in the history if it's a user message
+        if anthropic_messages and anthropic_messages[-1]["role"] == "user":
+            user_msg = anthropic_messages[-1]
+            if isinstance(user_msg["content"], list) and user_msg["content"]:
+                # Ensure the last block of the user message has cache_control
+                user_msg["content"][-1]["cache_control"] = {"type": "ephemeral"}
+            elif isinstance(user_msg["content"], str):
+                user_msg["content"] = [
+                    {
+                        "type": "text",
+                        "text": user_msg["content"],
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": anthropic_messages,
             "max_tokens": max_tokens or 4096,
-            "temperature": temperature,
             "stream": stream,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
 
-        if system_content:
-            payload["system"] = system_content
+        if system_blocks:
+            payload["system"] = system_blocks
 
         # Handle Extended Thinking
         thinking = kwargs.pop("thinking", None)
@@ -1384,6 +1477,8 @@ class AnthropicClient(LLMClient):
                         "description": func.get("description", ""),
                         "input_schema": func.get("parameters", {"type": "object"}),
                     })
+            if anthropic_tools:
+                anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
             payload["tools"] = anthropic_tools
 
         payload.update(kwargs)
@@ -1393,12 +1488,12 @@ class AnthropicClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Non-streaming completion."""
-        url = f"{self.base_url.rstrip('/')}/v1/messages"
+        url = f"{self._normalize_base_url()}/v1/messages"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=False, **kwargs)
 
         client = await self._get_client()
@@ -1454,14 +1549,14 @@ class AnthropicClient(LLMClient):
         self,
         messages: list[LLMMessage],
         tools: list[dict] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
         on_chunk: ChunkCallback | None = None,
         on_thinking: ThinkingCallback | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Streaming completion."""
-        url = f"{self.base_url.rstrip('/')}/v1/messages"
+        url = f"{self._normalize_base_url()}/v1/messages"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=True, **kwargs)
 
         full_content = ""
@@ -1684,6 +1779,14 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         protocol="openai_compatible",
         default_base_url="https://open.bigmodel.cn/api/paas/v4",
         default_max_tokens=8192,
+    ),
+    "baidu": ProviderSpec(
+        provider="baidu",
+        display_name="Baidu (Qianfan)",
+        protocol="openai_compatible",
+        default_base_url="https://qianfan.baidubce.com/v2",
+        supports_tool_choice=False,
+        default_max_tokens=4096,
     ),
     "gemini": ProviderSpec(
         provider="gemini",
@@ -1918,7 +2021,7 @@ async def chat_complete(
     messages: list[dict],
     base_url: str | None = None,
     tools: list[dict] | None = None,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float = 120.0,
 ) -> dict:
@@ -1960,7 +2063,7 @@ async def chat_stream(
     messages: list[dict],
     base_url: str | None = None,
     tools: list[dict] | None = None,
-    temperature: float = 0.7,
+    temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float = 120.0,
     on_chunk: ChunkCallback | None = None,

@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
-import { authApi } from '../services/api';
+import { authApi, tenantApi, fetchJson } from '../services/api';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
@@ -11,6 +11,11 @@ export default function Login() {
     const [isRegister, setIsRegister] = useState(false);
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
+    const [tenant, setTenant] = useState<any>(null);
+    const [resolving, setResolving] = useState(true);
+    const [ssoProviders, setSsoProviders] = useState<any[]>([]);
+    const [ssoLoading, setSsoLoading] = useState(false);
+    const [ssoError, setSsoError] = useState('');
 
     const [form, setForm] = useState({
         username: '',
@@ -21,7 +26,55 @@ export default function Login() {
     // Login page always uses dark theme (hero panel is dark)
     useEffect(() => {
         document.documentElement.setAttribute('data-theme', 'dark');
+
+        // Resolve tenant by domain
+        const domain = window.location.hostname;
+        // In development, ignore localhost/127.0.0.1 unless its a subdomain we want to test
+        if (domain === 'localhost' || domain === '127.0.0.1' || domain.includes('.local')) {
+            setResolving(false);
+            return;
+        }
+
+        tenantApi.resolveByDomain(domain)
+            .then(res => {
+                if (res) {
+                    setTenant(res);
+                }
+            })
+            .catch(() => { })
+            .finally(() => setResolving(false));
     }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        if (!tenant?.sso_enabled || isRegister) {
+            setSsoProviders([]);
+            setSsoError('');
+            return;
+        }
+        if (!tenant?.id) return;
+
+        setSsoLoading(true);
+        setSsoError('');
+
+        fetchJson<{ session_id: string }>(`/sso/session?tenant_id=${tenant.id}`, { method: 'POST' })
+            .then(res => fetchJson<any[]>(`/sso/config?sid=${res.session_id}`))
+            .then(providers => {
+                if (cancelled) return;
+                setSsoProviders(providers || []);
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setSsoError(t('auth.ssoLoadFailed', 'Failed to load SSO providers.'));
+                setSsoProviders([]);
+            })
+            .finally(() => {
+                if (cancelled) return;
+                setSsoLoading(false);
+            });
+
+        return () => { cancelled = true; };
+    }, [tenant?.id, tenant?.sso_enabled, isRegister, t]);
 
     const toggleLang = () => {
         i18n.changeLanguage(i18n.language === 'zh' ? 'en' : 'zh');
@@ -40,11 +93,16 @@ export default function Login() {
                     display_name: form.username,
                 });
             } else {
-                res = await authApi.login({ username: form.username, password: form.password });
+                res = await authApi.login({
+                    username: form.username,
+                    password: form.password,
+                    // Pass tenant_id for domain-scoped login enforcement
+                    ...(tenant?.id ? { tenant_id: tenant.id } : {}),
+                });
             }
             setAuth(res.user, res.access_token);
             // Redirect to company setup if user has no company assigned
-            if (res.needs_company_setup) {
+            if (res.user && !res.user.tenant_id) {
                 navigate('/setup-company');
             } else {
                 navigate('/');
@@ -55,22 +113,30 @@ export default function Login() {
             if (msg && msg !== 'Failed to fetch' && !msg.includes('NetworkError') && !msg.includes('ERR_CONNECTION')) {
                 // Translate known error messages
                 if (msg.includes('company has been disabled')) {
-                    setError(t('auth.companyDisabled', 'Your company has been disabled. Please contact the platform administrator.'));
+                    setError(t('auth.companyDisabled'));
                 } else if (msg.includes('Invalid credentials')) {
-                    setError(t('auth.invalidCredentials', 'Invalid username or password.'));
+                    setError(t('auth.invalidCredentials'));
                 } else if (msg.includes('Account is disabled')) {
-                    setError(t('auth.accountDisabled', 'Your account has been disabled.'));
+                    setError(t('auth.accountDisabled'));
+                } else if (msg.includes('does not belong to this organization')) {
+                    setError(t('auth.notInOrganization', 'This account does not belong to this organization.'));
                 } else if (msg.includes('500') || msg.includes('Internal Server Error')) {
-                    setError(t('auth.serverStarting', 'Service is starting up or experiencing issues. Please try again in a few seconds.'));
+                    setError(t('auth.serverStarting'));
                 } else {
                     setError(msg);
                 }
             } else {
-                setError(t('auth.serverUnreachable', 'Unable to reach server. Please check if the service is running and try again.'));
+                setError(t('auth.serverUnreachable'));
             }
         } finally {
             setLoading(false);
         }
+    };
+
+    const ssoMeta: Record<string, { label: string; icon: string }> = {
+        feishu: { label: 'Feishu', icon: '/feishu.png' },
+        dingtalk: { label: 'DingTalk', icon: '/dingtalk.png' },
+        wecom: { label: 'WeCom', icon: '/wecom.png' },
     };
 
     return (
@@ -81,36 +147,33 @@ export default function Login() {
                 <div className="login-hero-content">
                     <div className="login-hero-badge">
                         <span className="login-hero-badge-dot" />
-                        Open Source · Multi-Agent Collaboration
+                        {t('login.hero.badge')}
                     </div>
                     <h1 className="login-hero-title">
-                        Clawith<br />
-                        <span style={{ fontSize: '0.65em', fontWeight: 600, opacity: 0.85 }}>OpenClaw for Teams</span>
+                        {t('login.hero.title')}<br />
+                        <span style={{ fontSize: '0.65em', fontWeight: 600, opacity: 0.85 }}>{t('login.hero.subtitle')}</span>
                     </h1>
-                    <p className="login-hero-desc">
-                        OpenClaw empowers individuals.<br />
-                        Clawith scales it to frontier organizations.
-                    </p>
+                    <p className="login-hero-desc" dangerouslySetInnerHTML={{ __html: t('login.hero.description') }} />
                     <div className="login-hero-features">
                         <div className="login-hero-feature">
                             <span className="login-hero-feature-icon">🤖</span>
                             <div>
-                                <div className="login-hero-feature-title">Multi-Agent Crew</div>
-                                <div className="login-hero-feature-desc">Agents collaborate autonomously</div>
+                                <div className="login-hero-feature-title">{t('login.hero.features.multiAgent.title')}</div>
+                                <div className="login-hero-feature-desc">{t('login.hero.features.multiAgent.description')}</div>
                             </div>
                         </div>
                         <div className="login-hero-feature">
                             <span className="login-hero-feature-icon">🧠</span>
                             <div>
-                                <div className="login-hero-feature-title">Persistent Memory</div>
-                                <div className="login-hero-feature-desc">Soul, memory, and self-evolution</div>
+                                <div className="login-hero-feature-title">{t('login.hero.features.persistentMemory.title')}</div>
+                                <div className="login-hero-feature-desc">{t('login.hero.features.persistentMemory.description')}</div>
                             </div>
                         </div>
                         <div className="login-hero-feature">
                             <span className="login-hero-feature-icon">🏛️</span>
                             <div>
-                                <div className="login-hero-feature-title">Agent Plaza</div>
-                                <div className="login-hero-feature-desc">Social feed for inter-agent interaction</div>
+                                <div className="login-hero-feature-title">{t('login.hero.features.agentPlaza.title')}</div>
+                                <div className="login-hero-feature-desc">{t('login.hero.features.agentPlaza.description')}</div>
                             </div>
                         </div>
                     </div>
@@ -128,7 +191,7 @@ export default function Login() {
                     background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
                     zIndex: 101,
                 }} onClick={toggleLang}>
-                    🌐 {i18n.language === 'zh' ? 'EN' : '中文'}
+                    🌐
                 </div>
 
                 <div className="login-form-wrapper">
@@ -145,6 +208,77 @@ export default function Login() {
                     {error && (
                         <div className="login-error">
                             <span>⚠</span> {error}
+                        </div>
+                    )}
+
+                    {tenant && tenant.sso_enabled && !isRegister && (
+                        <div style={{ marginBottom: '24px' }}>
+                            <div style={{
+                                padding: '16px', borderRadius: '12px', background: 'rgba(59,130,246,0.08)',
+                                border: '1px solid rgba(59,130,246,0.15)', marginBottom: '16px',
+                                textAlign: 'center'
+                            }}>
+                                <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '4px' }}>
+                                    {tenant.name}
+                                </div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                    {t('auth.ssoNotice', 'Enterprise SSO is enabled for this domain.')}
+                                </div>
+                            </div>
+
+                            {ssoLoading && (
+                                <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
+                                    {t('auth.ssoLoading', 'Loading SSO providers...')}
+                                </div>
+                            )}
+
+                            {!ssoLoading && ssoProviders.length > 0 && (
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
+                                    {ssoProviders.map(p => {
+                                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
+                                        return (
+                                            <button
+                                                key={p.provider_type}
+                                                className="login-submit"
+                                                style={{
+                                                    background: 'var(--bg-secondary)',
+                                                    color: 'var(--text-primary)',
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center',
+                                                    gap: '10px',
+                                                    border: '1px solid var(--border-subtle)',
+                                                }}
+                                                onClick={() => window.location.href = p.url}
+                                            >
+                                                {meta.icon ? (
+                                                    <img src={meta.icon} alt={meta.label} width={18} height={18} style={{ borderRadius: '4px' }} />
+                                                ) : (
+                                                    <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
+                                                        {(meta.label || '').slice(0, 1).toUpperCase()}
+                                                    </span>
+                                                )}
+                                                {meta.label || p.name || p.provider_type}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            {!ssoLoading && ssoProviders.length === 0 && (
+                                <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
+                                    {ssoError || t('auth.ssoNoProviders', 'No SSO providers configured.')}
+                                </div>
+                            )}
+
+                            <div style={{
+                                display: 'flex', alignItems: 'center', gap: '12px',
+                                margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
+                            }}>
+                                <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+                                {t('auth.or', 'or')}
+                                <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+                            </div>
                         </div>
                     )}
 
@@ -183,6 +317,17 @@ export default function Login() {
                                 placeholder={t('auth.passwordPlaceholder')}
                             />
                         </div>
+
+                        {!isRegister && (
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '-4px', marginBottom: '8px' }}>
+                                <Link
+                                    to="/forgot-password"
+                                    style={{ fontSize: '13px', color: 'var(--accent-primary)', textDecoration: 'none' }}
+                                >
+                                    {t('auth.forgotPassword', 'Forgot password?')}
+                                </Link>
+                            </div>
+                        )}
 
                         <button className="login-submit" type="submit" disabled={loading}>
                             {loading ? (

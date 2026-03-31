@@ -2,11 +2,11 @@
 
 import asyncio
 import json
-import logging
 import threading
 from typing import Any, Dict
 import uuid
 
+from loguru import logger
 try:
     import lark_oapi as lark
     import lark_oapi.ws as ws
@@ -20,7 +20,6 @@ from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from sqlalchemy import select
 
-logger = logging.getLogger(__name__)
 
 if not _HAS_LARK:
     logger.warning(
@@ -46,6 +45,7 @@ class FeishuWSManager:
             try:
                 # The data object carries the raw event body
                 raw_body = getattr(data, "raw_body", None)
+                logger.info(f"[Feishu WS] Received event: {data}")
                 if not raw_body:
                     # Some SDK versions pass the dict directly
                     if isinstance(data, dict):

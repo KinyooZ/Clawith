@@ -15,21 +15,42 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
 
     if (!res.ok) {
         // Auto-logout on expired/invalid token (but not on auth endpoints — let them show errors)
-        const isAuthEndpoint = url.startsWith('/auth/login') || url.startsWith('/auth/register');
+        const isAuthEndpoint = url.startsWith('/auth/login')
+            || url.startsWith('/auth/register')
+            || url.startsWith('/auth/forgot-password')
+            || url.startsWith('/auth/reset-password');
         if (res.status === 401 && !isAuthEndpoint) {
             localStorage.removeItem('token');
             localStorage.removeItem('user');
             window.location.href = '/login';
             throw new Error('Session expired');
         }
-        const error = await res.json().catch(() => ({ detail: 'Request failed' }));
+        const bodyText = await res.text();
+        let error: { detail?: unknown };
+        try {
+            error = bodyText ? JSON.parse(bodyText) : {};
+        } catch {
+            const snippet = bodyText.trim().slice(0, 280);
+            error = {
+                detail: snippet || `HTTP ${res.status} ${res.statusText || ''}`.trim(),
+            };
+        }
         // Pydantic validation errors return detail as an array of objects
+        const fieldLabels: Record<string, string> = {
+            name: '名称',
+            role_description: '角色描述',
+            agent_type: '智能体类型',
+            primary_model_id: '主模型',
+            max_tokens_per_day: '每日 Token 上限',
+            max_tokens_per_month: '每月 Token 上限',
+        };
         let message = '';
         if (Array.isArray(error.detail)) {
             message = error.detail
                 .map((e: any) => {
                     const field = e.loc?.slice(-1)[0] || '';
-                    return field ? `${field}: ${e.msg}` : e.msg;
+                    const label = fieldLabels[field] || field;
+                    return label ? `${label}: ${e.msg}` : e.msg;
                 })
                 .join('; ');
         } else {
@@ -41,6 +62,9 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     if (res.status === 204) return undefined as T;
     return res.json();
 }
+
+/** Legacy/Internal generic fetcher */
+export const fetchJson = request;
 
 async function uploadFile(url: string, file: File, extraFields?: Record<string, string>): Promise<any> {
     const token = localStorage.getItem('token');
@@ -121,8 +145,14 @@ export const authApi = {
     register: (data: { username: string; email: string; password: string; display_name: string }) =>
         request<TokenResponse>('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
 
-    login: (data: { username: string; password: string }) =>
+    login: (data: { username: string; password: string; tenant_id?: string }) =>
         request<TokenResponse>('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
+
+    forgotPassword: (data: { email: string }) =>
+        request<{ ok: boolean; message: string }>('/auth/forgot-password', { method: 'POST', body: JSON.stringify(data) }),
+
+    resetPassword: (data: { token: string; new_password: string }) =>
+        request<{ ok: boolean }>('/auth/reset-password', { method: 'POST', body: JSON.stringify(data) }),
 
     me: () => request<User>('/auth/me'),
 
@@ -140,6 +170,9 @@ export const tenantApi = {
 
     registrationConfig: () =>
         request<{ allow_self_create_company: boolean }>('/tenants/registration-config'),
+
+    resolveByDomain: (domain: string) =>
+        request<any>(`/tenants/resolve-by-domain?domain=${encodeURIComponent(domain)}`),
 };
 
 export const adminApi = {
@@ -148,6 +181,9 @@ export const adminApi = {
 
     createCompany: (data: { name: string }) =>
         request<any>('/admin/companies', { method: 'POST', body: JSON.stringify(data) }),
+
+    updateCompany: (id: string, data: any) =>
+        request<any>(`/tenants/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
 
     toggleCompany: (id: string) =>
         request<any>(`/admin/companies/${id}/toggle`, { method: 'PUT' }),
@@ -347,10 +383,7 @@ export const scheduleApi = {
 
 // ─── Skills ───────────────────────────────────────────
 export const skillApi = {
-    list: () => {
-        const tid = localStorage.getItem('current_tenant_id');
-        return request<any[]>(`/skills/${tid ? `?tenant_id=${tid}` : ''}`);
-    },
+    list: () => request<any[]>('/skills/'),
     get: (id: string) => request<any>(`/skills/${id}`),
     create: (data: any) =>
         request<any>('/skills/', { method: 'POST', body: JSON.stringify(data) }),
@@ -367,6 +400,31 @@ export const skillApi = {
         delete: (path: string) =>
             request<any>(`/skills/browse/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
     },
+    // ClawHub marketplace integration
+    clawhub: {
+        search: (q: string) => request<any[]>(`/skills/clawhub/search?q=${encodeURIComponent(q)}`),
+        detail: (slug: string) => request<any>(`/skills/clawhub/detail/${slug}`),
+        install: (slug: string) => request<any>('/skills/clawhub/install', { method: 'POST', body: JSON.stringify({ slug }) }),
+    },
+    importFromUrl: (url: string) =>
+        request<any>('/skills/import-from-url', { method: 'POST', body: JSON.stringify({ url }) }),
+    previewUrl: (url: string) =>
+        request<any>('/skills/import-from-url/preview', { method: 'POST', body: JSON.stringify({ url }) }),
+    // Tenant-level settings
+    settings: {
+        getToken: () => request<{ configured: boolean; source: string; masked: string; clawhub_configured: boolean; clawhub_masked: string }>('/skills/settings/token'),
+        setToken: (github_token: string) =>
+            request<any>('/skills/settings/token', { method: 'PUT', body: JSON.stringify({ github_token }) }),
+        setClawhubKey: (clawhub_key: string) =>
+            request<any>('/skills/settings/token', { method: 'PUT', body: JSON.stringify({ clawhub_key }) }),
+    },
+    // Agent-level import (writes to agent workspace)
+    agentImport: {
+        fromClawhub: (agentId: string, slug: string) =>
+            request<any>(`/agents/${agentId}/files/import-from-clawhub`, { method: 'POST', body: JSON.stringify({ slug }) }),
+        fromUrl: (agentId: string, url: string) =>
+            request<any>(`/agents/${agentId}/files/import-from-url`, { method: 'POST', body: JSON.stringify({ url }) }),
+    },
 };
 
 // ─── Triggers (Aware Engine) ──────────────────────────
@@ -379,4 +437,40 @@ export const triggerApi = {
 
     delete: (agentId: string, triggerId: string) =>
         request<void>(`/agents/${agentId}/triggers/${triggerId}`, { method: 'DELETE' }),
+};
+
+// ─── Agent Credentials ────────────────────────────────
+export const credentialApi = {
+    list: (agentId: string) =>
+        request<any[]>(`/agents/${agentId}/credentials/`),
+
+    create: (agentId: string, data: any) =>
+        request<any>(`/agents/${agentId}/credentials/`, { method: 'POST', body: JSON.stringify(data) }),
+
+    update: (agentId: string, credentialId: string, data: any) =>
+        request<any>(`/agents/${agentId}/credentials/${credentialId}`, { method: 'PUT', body: JSON.stringify(data) }),
+
+    delete: (agentId: string, credentialId: string) =>
+        request<void>(`/agents/${agentId}/credentials/${credentialId}`, { method: 'DELETE' }),
+};
+
+// ─── AgentBay Take Control ────────────────────────────
+export const controlApi = {
+    click: (agentId: string, data: { session_id: string; x: number; y: number; button?: string }) =>
+        request<any>(`/agents/${agentId}/control/click`, { method: 'POST', body: JSON.stringify(data) }),
+
+    type: (agentId: string, data: { session_id: string; text: string }) =>
+        request<any>(`/agents/${agentId}/control/type`, { method: 'POST', body: JSON.stringify(data) }),
+
+    pressKeys: (agentId: string, data: { session_id: string; keys: string[] }) =>
+        request<any>(`/agents/${agentId}/control/press_keys`, { method: 'POST', body: JSON.stringify(data) }),
+
+    screenshot: (agentId: string, data: { session_id: string }) =>
+        request<any>(`/agents/${agentId}/control/screenshot`, { method: 'POST', body: JSON.stringify(data) }),
+
+    lock: (agentId: string, data: { session_id: string; platform_hint?: string }) =>
+        request<any>(`/agents/${agentId}/control/lock`, { method: 'POST', body: JSON.stringify(data) }),
+
+    unlock: (agentId: string, data: { session_id: string; export_cookies?: boolean; platform_hint?: string }) =>
+        request<any>(`/agents/${agentId}/control/unlock`, { method: 'POST', body: JSON.stringify(data) }),
 };

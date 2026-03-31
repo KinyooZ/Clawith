@@ -8,6 +8,7 @@ the agent uses Jira, Confluence, and Compass via the Atlassian Rovo MCP server.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +47,10 @@ async def configure_atlassian_channel(
 
     cloud_id = (data.get("cloud_id") or "").strip()
 
+    from app.core.security import encrypt_data
+    from app.config import get_settings
+    encrypted_key = encrypt_data(api_key, get_settings().SECRET_KEY)
+
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -54,7 +59,7 @@ async def configure_atlassian_channel(
     )
     existing = result.scalar_one_or_none()
     if existing:
-        existing.app_secret = api_key
+        existing.app_secret = encrypted_key
         existing.is_configured = True
         existing.extra_config = {**(existing.extra_config or {}), "cloud_id": cloud_id}
         await db.commit()
@@ -67,7 +72,7 @@ async def configure_atlassian_channel(
         agent_id=agent_id,
         channel_type="atlassian",
         app_id="atlassian",
-        app_secret=api_key,
+        app_secret=encrypted_key,
         is_configured=True,
         extra_config={"cloud_id": cloud_id},
     )
@@ -181,19 +186,19 @@ async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> 
     from app.database import async_session
     from sqlalchemy import select as sa_select
 
-    print(f"[AtlassianChannel] Syncing tools for agent {agent_id} ...", flush=True)
+    logger.info(f"[AtlassianChannel] Syncing tools for agent {agent_id} ...")
     try:
         client = MCPClient(ATLASSIAN_MCP_URL, api_key=api_key)
         tools_discovered = await client.list_tools()
     except Exception as e:
-        print(f"[AtlassianChannel] ⚠️ Could not list tools: {e}", flush=True)
+        logger.error(f"[AtlassianChannel] Could not list tools: {e}")
         return
 
     if not tools_discovered:
-        print("[AtlassianChannel] ⚠️ No tools returned from Atlassian MCP", flush=True)
+        logger.warning("[AtlassianChannel] No tools returned from Atlassian MCP")
         return
 
-    print(f"[AtlassianChannel] Found {len(tools_discovered)} tools, assigning to agent {agent_id}", flush=True)
+    logger.info(f"[AtlassianChannel] Found {len(tools_discovered)} tools, assigning to agent {agent_id}")
 
     async with async_session() as db:
         assigned = 0
@@ -232,6 +237,7 @@ async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> 
                     mcp_tool_name=raw_name,
                     enabled=True,
                     is_default=False,
+                    source="admin",
                 )
                 db.add(tool)
                 await db.flush()
@@ -264,7 +270,7 @@ async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> 
                 assigned += 1
 
         await db.commit()
-    print(f"[AtlassianChannel] ✅ {assigned} new tool assignments for agent {agent_id}", flush=True)
+    logger.info(f"[AtlassianChannel] {assigned} new tool assignments for agent {agent_id}")
 
 
 async def get_atlassian_api_key_for_agent(agent_id: uuid.UUID, db=None) -> str | None:
@@ -272,6 +278,8 @@ async def get_atlassian_api_key_for_agent(agent_id: uuid.UUID, db=None) -> str |
     from app.database import async_session
 
     async def _fetch(session):
+        from app.core.security import decrypt_data
+        from app.config import get_settings
         result = await session.execute(
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
@@ -280,7 +288,13 @@ async def get_atlassian_api_key_for_agent(agent_id: uuid.UUID, db=None) -> str |
             )
         )
         config = result.scalar_one_or_none()
-        return config.app_secret if config else None
+        if not config or not config.app_secret:
+            return None
+        
+        try:
+            return decrypt_data(config.app_secret, get_settings().SECRET_KEY)
+        except Exception:
+            return config.app_secret
 
     if db is not None:
         return await _fetch(db)
